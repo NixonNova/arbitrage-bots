@@ -1,0 +1,59 @@
+import { TRADE_LIMIT_USD } from "../config/trading";
+
+export type ArbitrageDirection =
+  | "buy-binance-sell-indodax"
+  | "buy-indodax-sell-binance";
+
+export interface ExecutedTrade {
+  direction: ArbitrageDirection;
+  profitUsdt: number;
+  profitPct: number;
+  tradeSizeBtc: number;
+  tradeNotionalUsd: number;
+  timestamp: Date;
+}
+
+export class TradeProgressTracker {
+  private trades: ExecutedTrade[] = [];
+
+  record(trade: ExecutedTrade): void {
+    this.trades.push(trade);
+  }
+
+  getTradeCount(): number {
+    return this.trades.length;
+  }
+
+  getSummary(): string {
+    if (this.trades.length === 0) {
+      return "Progress: 0 trades";
+    }
+
+    const totalUsdt = this.trades.reduce((sum, trade) => sum + trade.profitUsdt, 0);
+    const totalPct = this.trades.reduce((sum, trade) => sum + trade.profitPct, 0);
+    const avgPct = totalPct / this.trades.length;
+
+    const usdtLabel = `${totalUsdt >= 0 ? "+" : ""}${totalUsdt.toFixed(2)} USDT`;
+    const totalPctLabel = `${totalPct >= 0 ? "+" : ""}${totalPct.toFixed(4)}%`;
+    const avgPctLabel = `${avgPct >= 0 ? "+" : ""}${avgPct.toFixed(4)}%`;
+
+    return `Progress: ${this.trades.length} trades ($${TRADE_LIMIT_USD} each), ${usdtLabel}, total ${totalPctLabel}, avg ${avgPctLabel}`;
+  }
+}
+
+export function createExecutedTrade(
+  direction: ArbitrageDirection,
+  profitPerBtc: number,
+  profitPct: number,
+  tradeSizeBtc: number,
+  tradeNotionalUsd: number,
+): ExecutedTrade {
+  return {
+    direction,
+    profitUsdt: profitPerBtc * tradeSizeBtc,
+    profitPct,
+    tradeSizeBtc,
+    tradeNotionalUsd,
+    timestamp: new Date(),
+  };
+}
