@@ -1,18 +1,25 @@
+import "./config/env";
 import { TAKER_FEES } from "./config/fees";
 import {
-  INITIAL_BINANCE_BTC,
+  INITIAL_BINANCE_ETH,
   INITIAL_BINANCE_USDT,
-  INITIAL_INDODAX_BTC,
+  INITIAL_INDODAX_ETH,
   INITIAL_INDODAX_USDT,
+  LIVE_TRADING,
   MIN_BALANCE_PCT,
   TRADE_LIMIT_USD,
 } from "./config/trading";
 import { subscribeBinanceOrderBook } from "./exchanges/binance";
+import { logExchangeBalances } from "./exchanges/balances";
 import { subscribeIndodaxOrderBook } from "./exchanges/indodax";
 import { OrderBookQuote } from "./types/quote";
-import { tryExecuteOpportunities, TradeOpportunity } from "./trading/executor";
 import {
-  getRequiredBtc,
+  assertLiveTradingCredentials,
+  tryExecuteOpportunities,
+  TradeOpportunity,
+} from "./trading/executor";
+import {
+  getRequiredEth,
   hasSufficientLiquidity,
 } from "./trading/liquidity";
 import {
@@ -44,6 +51,7 @@ const quotes: Record<string, OrderBookQuote> = {};
 const tradeProgress = new TradeProgressTracker();
 const wallet = createWalletTracker();
 let lastSpreadKey = "";
+let spreadLogInFlight = false;
 
 function formatSpread(
   sellBid: string,
@@ -96,10 +104,10 @@ function buildTradeOpportunity(
     return null;
   }
 
-  const tradeSizeBtc = getRequiredBtc(buyAskPrice, TRADE_LIMIT_USD);
+  const tradeSizeEth = getRequiredEth(buyAskPrice, TRADE_LIMIT_USD);
   const settlement = {
     direction,
-    tradeSizeBtc,
+    tradeSizeEth,
     buyAskPrice,
     sellBidPrice,
     buyTakerFee,
@@ -112,9 +120,9 @@ function buildTradeOpportunity(
 
   return {
     direction,
-    profitPerBtc: spread.diff,
+    profitPerEth: spread.diff,
     profitPct: spread.pct,
-    tradeSizeBtc,
+    tradeSizeEth,
     tradeNotionalUsd: TRADE_LIMIT_USD,
     buyAskPrice,
     sellBidPrice,
@@ -130,20 +138,20 @@ function getLiquiditySkipReason(
     return null;
   }
 
-  const requiredBtc = getRequiredBtc(
+  const requiredEth = getRequiredEth(
     opportunity.buyAskPrice,
     TRADE_LIMIT_USD,
   );
 
-  if (requiredBtc <= 0) {
+  if (requiredEth <= 0) {
     return `${opportunity.label}: invalid price`;
   }
 
-  if (opportunity.buyAskQty < requiredBtc) {
+  if (opportunity.buyAskQty < requiredEth) {
     return `${opportunity.label}: insufficient ask liquidity`;
   }
 
-  if (opportunity.sellBidQty < requiredBtc) {
+  if (opportunity.sellBidQty < requiredEth) {
     return `${opportunity.label}: insufficient bid liquidity`;
   }
 
@@ -158,10 +166,10 @@ function getWalletSkipReason(
     return null;
   }
 
-  const tradeSizeBtc = getRequiredBtc(opportunity.buyAskPrice, TRADE_LIMIT_USD);
+  const tradeSizeEth = getRequiredEth(opportunity.buyAskPrice, TRADE_LIMIT_USD);
   const reason = walletTracker.getAffordabilityReason({
     direction: opportunity.direction,
-    tradeSizeBtc,
+    tradeSizeEth,
     buyAskPrice: opportunity.buyAskPrice,
     sellBidPrice: opportunity.sellBidPrice,
     buyTakerFee: opportunity.buyTakerFee,
@@ -176,6 +184,27 @@ function getWalletSkipReason(
 }
 
 function logSpread(): void {
+  void logSpreadAsync();
+}
+
+async function logSpreadAsync(): Promise<void> {
+  if (spreadLogInFlight) {
+    return;
+  }
+
+  spreadLogInFlight = true;
+
+  try {
+    await logSpreadLocked();
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.error("[Spread] Failed to evaluate/execute:", message);
+  } finally {
+    spreadLogInFlight = false;
+  }
+}
+
+async function logSpreadLocked(): Promise<void> {
   const binance = quotes.Binance;
   const indodax = quotes.Indodax;
   if (!binance || !indodax) {
@@ -240,7 +269,7 @@ function logSpread(): void {
       .filter((reason): reason is string => reason !== null),
   ];
 
-  const executedLabels = tryExecuteOpportunities(
+  const executedLabels = await tryExecuteOpportunities(
     tradeOpportunities,
     tradeProgress,
     wallet,
@@ -254,7 +283,9 @@ function logSpread(): void {
     skippedLabels.length > 0
       ? ` | [SKIPPED: ${skippedLabels.join(", ")}]`
       : "";
-  const haltedSuffix = wallet.isHalted() ? " | [HALTED: low balance]" : "";
+  const haltedSuffix = wallet.isHalted()
+    ? ` | [HALTED: ${wallet.getHaltReason() ?? "trading stopped"}]`
+    : "";
   const progressSuffix =
     tradeProgress.getTradeCount() > 0
       ? ` | ${tradeProgress.getSummary()}`
@@ -292,18 +323,25 @@ subscribeIndodaxOrderBook((quote) => {
   logQuotes("Indodax", quote);
 });
 
-console.log("Subscribing to Bitcoin order books on Binance and Indodax...");
+console.log("Subscribing to Ethereum order books on Binance and Indodax...");
+assertLiveTradingCredentials();
+console.log(
+  LIVE_TRADING
+    ? "Live trading: ON — real market orders will be placed"
+    : "Live trading: OFF — simulation only (set LIVE_TRADING=true to place real orders)",
+);
 console.log(
   `Taker fees: Binance ${(TAKER_FEES.binance * 100).toFixed(4)}%, Indodax buy ${(TAKER_FEES.indodax.buy * 100).toFixed(4)}% / sell ${(TAKER_FEES.indodax.sell * 100).toFixed(4)}%`,
 );
 console.log(`Trade size: $${TRADE_LIMIT_USD.toFixed(2)} per execution`);
 console.log(
-  `Initial wallet: Binance BTC ${INITIAL_BINANCE_BTC}, USDT ${INITIAL_BINANCE_USDT} | Indodax BTC ${INITIAL_INDODAX_BTC}, USDT ${INITIAL_INDODAX_USDT}`,
+  `Initial wallet: Binance ETH ${INITIAL_BINANCE_ETH}, USDT ${INITIAL_BINANCE_USDT} | Indodax ETH ${INITIAL_INDODAX_ETH}, USDT ${INITIAL_INDODAX_USDT}`,
 );
 console.log(
   `Trading stops when any balance falls to ${(MIN_BALANCE_PCT * 100).toFixed(0)}% of initial`,
 );
 console.log(`[Wallet] ${wallet.formatBalances()}`);
+void logExchangeBalances();
 
 const HEARTBEAT_INTERVAL_MS = 5 * 60 * 1000;
 let elapsedMinutes = 0;
@@ -311,4 +349,5 @@ let elapsedMinutes = 0;
 setInterval(() => {
   elapsedMinutes += 5;
   console.log(`${elapsedMinutes} minutes elapsed`);
+  void logExchangeBalances();
 }, HEARTBEAT_INTERVAL_MS);

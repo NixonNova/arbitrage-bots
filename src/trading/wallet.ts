@@ -1,22 +1,22 @@
 import {
-  INITIAL_BINANCE_BTC,
+  INITIAL_BINANCE_ETH,
   INITIAL_BINANCE_USDT,
-  INITIAL_INDODAX_BTC,
+  INITIAL_INDODAX_ETH,
   INITIAL_INDODAX_USDT,
   MIN_BALANCE_PCT,
 } from "../config/trading";
 import { ArbitrageDirection } from "./progress";
 
 export interface WalletBalances {
-  binanceBtc: number;
+  binanceEth: number;
   binanceUsdt: number;
-  indodaxBtc: number;
+  indodaxEth: number;
   indodaxUsdt: number;
 }
 
 export interface TradeSettlement {
   direction: ArbitrageDirection;
-  tradeSizeBtc: number;
+  tradeSizeEth: number;
   buyAskPrice: number;
   sellBidPrice: number;
   buyTakerFee: number;
@@ -24,9 +24,9 @@ export interface TradeSettlement {
 }
 
 const BALANCE_LABELS: Record<keyof WalletBalances, string> = {
-  binanceBtc: "Binance BTC",
+  binanceEth: "Binance ETH",
   binanceUsdt: "Binance USDT",
-  indodaxBtc: "Indodax BTC",
+  indodaxEth: "Indodax ETH",
   indodaxUsdt: "Indodax USDT",
 };
 
@@ -34,6 +34,7 @@ export class WalletTracker {
   private readonly initial: WalletBalances;
   private current: WalletBalances;
   private halted = false;
+  private haltReason: string | null = null;
 
   constructor(initial: WalletBalances) {
     this.initial = { ...initial };
@@ -42,6 +43,20 @@ export class WalletTracker {
 
   isHalted(): boolean {
     return this.halted;
+  }
+
+  getHaltReason(): string | null {
+    return this.halted ? this.haltReason : null;
+  }
+
+  halt(reason: string): void {
+    if (this.halted) {
+      return;
+    }
+
+    this.halted = true;
+    this.haltReason = reason;
+    console.error(`[Halt] Trading halted: ${reason}`);
   }
 
   getBalances(): WalletBalances {
@@ -55,40 +70,40 @@ export class WalletTracker {
 
     const buyCostUsdt =
       settlement.buyAskPrice *
-      settlement.tradeSizeBtc *
+      settlement.tradeSizeEth *
       (1 + settlement.buyTakerFee);
-    const sellBtc = settlement.tradeSizeBtc;
+    const sellEth = settlement.tradeSizeEth;
 
     if (settlement.direction === "buy-binance-sell-indodax") {
       return (
         this.current.binanceUsdt >= buyCostUsdt &&
-        this.current.indodaxBtc >= sellBtc
+        this.current.indodaxEth >= sellEth
       );
     }
 
     return (
       this.current.indodaxUsdt >= buyCostUsdt &&
-      this.current.binanceBtc >= sellBtc
+      this.current.binanceEth >= sellEth
     );
   }
 
   getAffordabilityReason(settlement: TradeSettlement): string | null {
     if (this.halted) {
-      return "trading halted: balance below 5% threshold";
+      return `trading halted: ${this.haltReason ?? "unknown reason"}`;
     }
 
     const buyCostUsdt =
       settlement.buyAskPrice *
-      settlement.tradeSizeBtc *
+      settlement.tradeSizeEth *
       (1 + settlement.buyTakerFee);
-    const sellBtc = settlement.tradeSizeBtc;
+    const sellEth = settlement.tradeSizeEth;
 
     if (settlement.direction === "buy-binance-sell-indodax") {
       if (this.current.binanceUsdt < buyCostUsdt) {
         return "insufficient Binance USDT";
       }
-      if (this.current.indodaxBtc < sellBtc) {
-        return "insufficient Indodax BTC";
+      if (this.current.indodaxEth < sellEth) {
+        return "insufficient Indodax ETH";
       }
       return null;
     }
@@ -96,8 +111,8 @@ export class WalletTracker {
     if (this.current.indodaxUsdt < buyCostUsdt) {
       return "insufficient Indodax USDT";
     }
-    if (this.current.binanceBtc < sellBtc) {
-      return "insufficient Binance BTC";
+    if (this.current.binanceEth < sellEth) {
+      return "insufficient Binance ETH";
     }
 
     return null;
@@ -106,23 +121,23 @@ export class WalletTracker {
   applyTrade(settlement: TradeSettlement): void {
     const buyCostUsdt =
       settlement.buyAskPrice *
-      settlement.tradeSizeBtc *
+      settlement.tradeSizeEth *
       (1 + settlement.buyTakerFee);
     const sellProceedsUsdt =
       settlement.sellBidPrice *
-      settlement.tradeSizeBtc *
+      settlement.tradeSizeEth *
       (1 - settlement.sellTakerFee);
-    const tradeBtc = settlement.tradeSizeBtc;
+    const tradeEth = settlement.tradeSizeEth;
 
     if (settlement.direction === "buy-binance-sell-indodax") {
       this.current.binanceUsdt -= buyCostUsdt;
-      this.current.binanceBtc += tradeBtc;
-      this.current.indodaxBtc -= tradeBtc;
+      this.current.binanceEth += tradeEth;
+      this.current.indodaxEth -= tradeEth;
       this.current.indodaxUsdt += sellProceedsUsdt;
     } else {
       this.current.indodaxUsdt -= buyCostUsdt;
-      this.current.indodaxBtc += tradeBtc;
-      this.current.binanceBtc -= tradeBtc;
+      this.current.indodaxEth += tradeEth;
+      this.current.binanceEth -= tradeEth;
       this.current.binanceUsdt += sellProceedsUsdt;
     }
 
@@ -141,9 +156,8 @@ export class WalletTracker {
       }
 
       if (this.current[key] <= initialBalance * MIN_BALANCE_PCT) {
-        this.halted = true;
-        console.log(
-          `[Wallet] Trading halted: ${BALANCE_LABELS[key]} at ${(this.current[key] / initialBalance * 100).toFixed(2)}% of initial (${this.current[key].toFixed(8)} remaining)`,
+        this.halt(
+          `${BALANCE_LABELS[key]} at ${((this.current[key] / initialBalance) * 100).toFixed(2)}% of initial (${this.current[key].toFixed(8)} remaining)`,
         );
         return;
       }
@@ -152,9 +166,9 @@ export class WalletTracker {
 
   formatBalances(): string {
     return [
-      `Binance BTC ${this.current.binanceBtc.toFixed(8)}`,
+      `Binance ETH ${this.current.binanceEth.toFixed(8)}`,
       `USDT ${this.current.binanceUsdt.toFixed(2)}`,
-      `| Indodax BTC ${this.current.indodaxBtc.toFixed(8)}`,
+      `| Indodax ETH ${this.current.indodaxEth.toFixed(8)}`,
       `USDT ${this.current.indodaxUsdt.toFixed(2)}`,
     ].join(" ");
   }
@@ -162,9 +176,9 @@ export class WalletTracker {
 
 export function createWalletTracker(): WalletTracker {
   return new WalletTracker({
-    binanceBtc: INITIAL_BINANCE_BTC,
+    binanceEth: INITIAL_BINANCE_ETH,
     binanceUsdt: INITIAL_BINANCE_USDT,
-    indodaxBtc: INITIAL_INDODAX_BTC,
+    indodaxEth: INITIAL_INDODAX_ETH,
     indodaxUsdt: INITIAL_INDODAX_USDT,
   });
 }

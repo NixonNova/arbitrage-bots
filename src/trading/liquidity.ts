@@ -1,6 +1,6 @@
 import { TRADE_LIMIT_USD } from "../config/trading";
 
-export function getRequiredBtc(
+export function getRequiredEth(
   buyAskPrice: number,
   tradeLimitUsd = TRADE_LIMIT_USD,
 ): number {
@@ -17,11 +17,11 @@ export function hasSufficientLiquidity(
   sellBidQty: number,
   tradeLimitUsd = TRADE_LIMIT_USD,
 ): boolean {
-  const requiredBtc = getRequiredBtc(buyAskPrice, tradeLimitUsd);
+  const requiredEth = getRequiredEth(buyAskPrice, tradeLimitUsd);
 
-  if (requiredBtc <= 0) {
+  if (requiredEth <= 0) {
     return false;
   }
 
-  return buyAskQty >= requiredBtc && sellBidQty >= requiredBtc;
+  return buyAskQty >= requiredEth && sellBidQty >= requiredEth;
 }

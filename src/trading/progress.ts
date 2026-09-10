@@ -8,7 +8,7 @@ export interface ExecutedTrade {
   direction: ArbitrageDirection;
   profitUsdt: number;
   profitPct: number;
-  tradeSizeBtc: number;
+  tradeSizeEth: number;
   tradeNotionalUsd: number;
   timestamp: Date;
 }
@@ -43,16 +43,16 @@ export class TradeProgressTracker {
 
 export function createExecutedTrade(
   direction: ArbitrageDirection,
-  profitPerBtc: number,
+  profitPerEth: number,
   profitPct: number,
-  tradeSizeBtc: number,
+  tradeSizeEth: number,
   tradeNotionalUsd: number,
 ): ExecutedTrade {
   return {
     direction,
-    profitUsdt: profitPerBtc * tradeSizeBtc,
+    profitUsdt: profitPerEth * tradeSizeEth,
     profitPct,
-    tradeSizeBtc,
+    tradeSizeEth,
     tradeNotionalUsd,
     timestamp: new Date(),
   };

@@ -12,6 +12,8 @@
  *
  * Override via environment variables if your account tier differs.
  */
+import "./env";
+
 function parseFeeRate(value: string | undefined, fallback: number): number {
   if (!value) {
     return fallback;

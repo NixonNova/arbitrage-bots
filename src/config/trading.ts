@@ -1,3 +1,5 @@
+import { envFlag } from "./env";
+
 function parseNumber(value: string | undefined, fallback: number): number {
   if (!value) {
     return fallback;
@@ -13,25 +15,31 @@ export const MIN_PROFIT_PCT = parseNumber(process.env.MIN_PROFIT_PCT, 0.01);
 /** Target notional trade size in USD per execution. */
 export const TRADE_LIMIT_USD = parseNumber(process.env.TRADE_LIMIT_USD, 15);
 
+/**
+ * When true, place real market orders on both exchanges.
+ * Requires BINANCE_API_KEY, BINANCE_API_SECRET, INDODAX_API_KEY, INDODAX_API_SECRET.
+ */
+export const LIVE_TRADING = envFlag("LIVE_TRADING", false);
+
 /** Stop trading when any wallet balance falls to this fraction of its initial value. */
 export const MIN_BALANCE_PCT = parseNumber(process.env.MIN_BALANCE_PCT, 0.1);
 
-export const INITIAL_BINANCE_BTC = parseNumber(
-  process.env.INITIAL_BINANCE_BTC,
-  0.006,
+export const INITIAL_BINANCE_ETH = parseNumber(
+  process.env.INITIAL_BINANCE_ETH,
+  10,
 );
 
 export const INITIAL_BINANCE_USDT = parseNumber(
   process.env.INITIAL_BINANCE_USDT,
-  500,
+  25000,
 );
 
-export const INITIAL_INDODAX_BTC = parseNumber(
-  process.env.INITIAL_INDODAX_BTC,
-  0.006,
+export const INITIAL_INDODAX_ETH = parseNumber(
+  process.env.INITIAL_INDODAX_ETH,
+  10,
 );
 
 export const INITIAL_INDODAX_USDT = parseNumber(
   process.env.INITIAL_INDODAX_USDT,
-  500,
+  25000,
 );
