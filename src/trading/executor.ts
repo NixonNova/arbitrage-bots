@@ -96,10 +96,10 @@ async function placeMarketOrder(
   return placeIndodaxMarketOrder(request);
 }
 
-function sellQuantityForExchange(exchange: ExchangeName, filledEth: number): number {
+function quantityForExchange(exchange: ExchangeName, eth: number): number {
   const decimals =
     exchange === "binance" ? BINANCE_QTY_DECIMALS : INDODAX_QTY_DECIMALS;
-  return roundDown(filledEth, decimals);
+  return roundDown(eth, decimals);
 }
 
 function haltUnpairedFill(
@@ -123,14 +123,29 @@ async function executeLivePair(
   const buyClientId = `arb1${stamp}`.slice(0, 36);
   const sellClientId = `arb2${stamp}`.slice(0, 36);
 
+  const buyQty = quantityForExchange(legs.buyExchange, opportunity.tradeSizeEth);
+  const plannedSellQty = quantityForExchange(legs.sellExchange, buyQty);
+  if (!(buyQty > 0)) {
+    throw new OrderError(
+      legs.buyExchange,
+      `Skipping buy: planned size ${opportunity.tradeSizeEth} ETH is below buy lot size`,
+    );
+  }
+  if (!(plannedSellQty > 0)) {
+    throw new OrderError(
+      legs.sellExchange,
+      `Skipping pair: buy qty ${buyQty} ETH is below sell lot size`,
+    );
+  }
+
   console.log(
-    `[Trade] Leg 1/2: ${legs.buyExchange} BUY ${opportunity.tradeSizeEth.toFixed(8)} ETH (~$${opportunity.tradeNotionalUsd.toFixed(2)})`,
+    `[Trade] Leg 1/2: ${legs.buyExchange} BUY ${buyQty.toFixed(8)} ETH (~$${opportunity.tradeNotionalUsd.toFixed(2)})`,
   );
 
   const buy = await placeMarketOrder(
     legs.buyExchange,
     "BUY",
-    opportunity.tradeSizeEth,
+    buyQty,
     opportunity.tradeNotionalUsd,
     buyClientId,
   );
@@ -139,7 +154,14 @@ async function executeLivePair(
     `[Trade] Leg 1 filled: ${buy.exchange} order ${buy.orderId} qty ${buy.executedQtyEth.toFixed(8)} ETH`,
   );
 
-  const sellQty = sellQuantityForExchange(legs.sellExchange, buy.executedQtyEth);
+  const filledBuyQty = quantityForExchange(legs.buyExchange, buy.executedQtyEth);
+  if (!(filledBuyQty > 0)) {
+    const detail = `buy fill ${buy.executedQtyEth} ETH is below buy lot size`;
+    haltUnpairedFill(wallet, buy, legs.sellExchange, detail);
+    throw new OrderError(legs.buyExchange, `Skipping sell: ${detail}`);
+  }
+
+  const sellQty = quantityForExchange(legs.sellExchange, filledBuyQty);
   if (!(sellQty > 0)) {
     const detail = `buy fill ${buy.executedQtyEth} ETH is below sell lot size`;
     haltUnpairedFill(wallet, buy, legs.sellExchange, detail);
