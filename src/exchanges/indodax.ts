@@ -1,5 +1,5 @@
 import WebSocket from "ws";
-import { INDODAX_ORDER_BOOK_CHANNEL } from "../config/market";
+import { INDODAX_ORDER_BOOK_CHANNEL, INDODAX_PAIR } from "../config/market";
 import { OrderBookQuote } from "../types/quote";
 import {
   INDODAX_PING_INTERVAL_MS,
@@ -13,6 +13,7 @@ import {
 } from "./connection";
 
 const INDODAX_WS_URL = "wss://ws3.indodax.com/ws/";
+const INDODAX_DEPTH_URL = `https://indodax.com/api/depth/${INDODAX_PAIR.replace("_", "")}`;
 const INDODAX_STATIC_TOKEN =
   "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJleHAiOjE5NDY2MTg0MTV9.UR1lBM6Eqh0yWz-PVirw1uPCxe60FdchR8eNVdsskeo";
 const ORDER_BOOK_CHANNEL = INDODAX_ORDER_BOOK_CHANNEL;
@@ -32,9 +33,49 @@ interface OrderBookData {
   bid: OrderBookLevel[];
 }
 
+export interface IndodaxTopOfBook {
+  bestBidPrice: number;
+  bestBidQty: number;
+  bestAskPrice: number;
+  bestAskQty: number;
+}
+
 function parsePositive(value: string | undefined): number {
   const parsed = Number(value);
   return Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
+}
+
+function depthLevel(row: [string, string] | undefined): { price: number; qty: number } {
+  return {
+    price: parsePositive(row?.[0]),
+    qty: parsePositive(row?.[1]),
+  };
+}
+
+/** Public REST first row: buy = bids, sell = asks. */
+export async function fetchIndodaxTopOfBook(): Promise<IndodaxTopOfBook> {
+  const response = await fetch(INDODAX_DEPTH_URL);
+  const payload = (await response.json()) as {
+    buy?: [string, string][];
+    sell?: [string, string][];
+    error?: string;
+  };
+  if (!response.ok || payload.error) {
+    throw new Error(payload.error ?? `HTTP ${response.status} fetching Indodax depth`);
+  }
+
+  const bid = depthLevel(payload.buy?.[0]);
+  const ask = depthLevel(payload.sell?.[0]);
+  if (!(bid.price > 0 && bid.qty > 0 && ask.price > 0 && ask.qty > 0)) {
+    throw new Error("Indodax depth missing a first bid/ask row");
+  }
+
+  return {
+    bestBidPrice: bid.price,
+    bestBidQty: bid.qty,
+    bestAskPrice: ask.price,
+    bestAskQty: ask.qty,
+  };
 }
 
 function getEthVolume(level: OrderBookLevel | undefined): string | undefined {

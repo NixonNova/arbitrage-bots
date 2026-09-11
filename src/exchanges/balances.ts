@@ -7,18 +7,42 @@ export interface SpotBalances {
   usdt: number;
 }
 
+export interface BothSpotBalances {
+  binance: SpotBalances;
+  indodax: SpotBalances;
+}
+
+const SPOT_API_KEYS = [
+  "BINANCE_API_KEY",
+  "BINANCE_API_SECRET",
+  "INDODAX_API_KEY",
+  "INDODAX_API_SECRET",
+] as const;
+
+export function missingSpotApiKeys(): string[] {
+  return SPOT_API_KEYS.filter((name) => !optionalEnv(name));
+}
+
 export function formatSpotBalances(balances: SpotBalances): string {
   return `ETH ${balances.eth.toFixed(8)} USDT ${balances.usdt.toFixed(2)}`;
 }
 
-export async function logExchangeBalances(): Promise<void> {
-  const missing = [
-    "BINANCE_API_KEY",
-    "BINANCE_API_SECRET",
-    "INDODAX_API_KEY",
-    "INDODAX_API_SECRET",
-  ].filter((name) => !optionalEnv(name));
+export async function fetchBothSpotBalances(): Promise<BothSpotBalances> {
+  const missing = missingSpotApiKeys();
+  if (missing.length > 0) {
+    throw new Error(`missing ${missing.join(", ")}`);
+  }
 
+  const [binance, indodax] = await Promise.all([
+    fetchBinanceSpotBalances(),
+    fetchIndodaxSpotBalances(),
+  ]);
+
+  return { binance, indodax };
+}
+
+export async function logExchangeBalances(): Promise<void> {
+  const missing = missingSpotApiKeys();
   if (missing.length > 0) {
     console.log(`[Balance] Skipped: missing ${missing.join(", ")}`);
     return;

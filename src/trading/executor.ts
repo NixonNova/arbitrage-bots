@@ -1,10 +1,17 @@
 import {
   BINANCE_QTY_DECIMALS,
+  INDODAX_PRICE_DECIMALS,
   INDODAX_QTY_DECIMALS,
 } from "../config/market";
-import { LIVE_TRADING } from "../config/trading";
+import { LIVE_TRADING, MAX_UNPAIRED_PAIRS, TRADE_LIMIT_USD } from "../config/trading";
 import { optionalEnv } from "../config/env";
-import { placeBinanceMarketOrder } from "../exchanges/binanceTrade";
+import {
+  placeBinanceMarketOrder,
+  ensureBinanceFilters,
+  binanceNotionalMeetsMinimum,
+  getBinanceMinNotionalUsdt,
+} from "../exchanges/binanceTrade";
+import { fetchIndodaxTopOfBook } from "../exchanges/indodax";
 import { placeIndodaxMarketOrder } from "../exchanges/indodaxTrade";
 import {
   OrderError,
@@ -20,6 +27,7 @@ import {
   TradeProgressTracker,
 } from "./progress";
 import { WalletTracker } from "./wallet";
+import { recordUnpairedPair } from "./unpaired";
 
 const DIRECTION_LABELS: Record<ArbitrageDirection, string> = {
   "buy-binance-sell-indodax": "Buy Binance / Sell Indodax",
@@ -110,6 +118,46 @@ function quantityForExchange(exchange: ExchangeName, eth: number): number {
   return roundDown(eth, decimals);
 }
 
+function sameLimitPrice(livePrice: number, plannedPrice: number): boolean {
+  return livePrice.toFixed(INDODAX_PRICE_DECIMALS) === plannedPrice.toFixed(INDODAX_PRICE_DECIMALS);
+}
+
+async function assertIndodaxFirstRowStillCovers(
+  side: "BUY" | "SELL",
+  quantityEth: number,
+  plannedPrice: number,
+): Promise<void> {
+  let live;
+  try {
+    live = await fetchIndodaxTopOfBook();
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    throw new OrderError("indodax", `Skipping ${side}: last-look depth failed (${message})`);
+  }
+  const livePrice = side === "BUY" ? live.bestAskPrice : live.bestBidPrice;
+  const liveQty = side === "BUY" ? live.bestAskQty : live.bestBidQty;
+  const liveNotional = livePrice * liveQty;
+  const bookSide = side === "BUY" ? "ask" : "bid";
+
+  console.log(
+    `[Indodax] Last look first ${bookSide}: ${liveQty} ETH @ ${livePrice} ($${liveNotional.toFixed(2)})`,
+  );
+
+  if (!sameLimitPrice(livePrice, plannedPrice)) {
+    throw new OrderError(
+      "indodax",
+      `Skipping ${side}: first ${bookSide} moved ${plannedPrice} → ${livePrice}`,
+    );
+  }
+
+  if (liveQty < quantityEth || liveNotional < TRADE_LIMIT_USD) {
+    throw new OrderError(
+      "indodax",
+      `Skipping ${side}: first ${bookSide} now ${liveQty} ETH ($${liveNotional.toFixed(2)}) < ${quantityEth} ETH / $${TRADE_LIMIT_USD.toFixed(2)}`,
+    );
+  }
+}
+
 function haltUnpairedFill(
   wallet: WalletTracker,
   first: PlacedOrder,
@@ -119,8 +167,12 @@ function haltUnpairedFill(
 ): void {
   const reason =
     `unpaired pair: ${first.exchange} ${first.side} filled (order ${first.orderId}, ${first.executedQtyEth.toFixed(8)} ETH) but ${secondExchange} ${secondSide} failed (${detail})`;
-  console.error(`[Trade] CRITICAL: ${reason}`);
-  wallet.halt(reason);
+  const shouldHalt = recordUnpairedPair(reason);
+  if (shouldHalt) {
+    wallet.halt(
+      `unpaired pair limit reached (${MAX_UNPAIRED_PAIRS}): ${reason}`,
+    );
+  }
 }
 
 async function executeLivePair(
@@ -158,6 +210,14 @@ async function executeLivePair(
     );
   }
 
+  const plannedIndodaxPrice =
+    indodaxSide === "BUY" ? opportunity.buyAskPrice : opportunity.sellBidPrice;
+  await assertIndodaxFirstRowStillCovers(
+    indodaxSide,
+    indodaxQty,
+    plannedIndodaxPrice,
+  );
+
   console.log(
     `[Trade] Leg 1/2: indodax ${indodaxSide} ${indodaxQty.toFixed(8)} ETH (~$${opportunity.tradeNotionalUsd.toFixed(2)})`,
   );
@@ -186,6 +246,16 @@ async function executeLivePair(
   const secondQty = quantityForExchange("binance", filledIndodaxQty);
   if (!(secondQty > 0)) {
     const detail = `Indodax fill ${first.executedQtyEth} ETH is below Binance lot size`;
+    haltUnpairedFill(wallet, first, "binance", binanceSide, detail);
+    throw new OrderError("binance", detail);
+  }
+
+  await ensureBinanceFilters();
+  const hedgePrice =
+    binanceSide === "SELL" ? opportunity.sellBidPrice : opportunity.buyAskPrice;
+  const hedgeNotional = secondQty * hedgePrice;
+  if (!binanceNotionalMeetsMinimum(secondQty, hedgePrice)) {
+    const detail = `Binance ${binanceSide} notional $${hedgeNotional.toFixed(2)} < min $${getBinanceMinNotionalUsdt().toFixed(2)} (${secondQty} ETH @ ${hedgePrice})`;
     haltUnpairedFill(wallet, first, "binance", binanceSide, detail);
     throw new OrderError("binance", detail);
   }

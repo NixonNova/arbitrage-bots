@@ -11,6 +11,11 @@ export const INDODAX_ORDER_BOOK_CHANNEL = "market:order-book-ethusdt";
 
 /** Binance ETHUSDT LOT_SIZE step is typically 0.0001. */
 export const BINANCE_QTY_DECIMALS = 4;
+/**
+ * Fallback if GET /api/v3/exchangeInfo is unavailable.
+ * Live ETHUSDT NOTIONAL.minNotional is currently 5 USDT.
+ */
+export const BINANCE_MIN_NOTIONAL_USD = 5;
 /** TAPIv2 rejects ETH amounts with more than 6 fraction digits. */
 export const INDODAX_QTY_DECIMALS = 6;
 /** ETH/USDT price fraction is also max 6 digits. */

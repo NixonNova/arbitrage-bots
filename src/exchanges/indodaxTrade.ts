@@ -210,6 +210,40 @@ async function fetchIndodaxOrderDetail(orderId: string): Promise<IndodaxV2OrderR
   return unwrapOrder((await response.json()) as IndodaxV2OrderResponse);
 }
 
+async function cancelIndodaxOrder(orderId: string): Promise<IndodaxV2OrderResponse> {
+  await ensureIndodaxTimeSynced();
+  const { apiKey, apiSecret } = getCredentials();
+  const query = new URLSearchParams({
+    symbol: INDODAX_TAPI_V2_SYMBOL,
+    orderId,
+    timestamp: indodaxTimestamp(),
+    recvWindow: "5000",
+  }).toString();
+  const response = await fetch(`${INDODAX_TAPI_V2_URL}/api/v2/order?${query}`, {
+    method: "DELETE",
+    headers: {
+      Accept: "application/json",
+      "X-APIKEY": apiKey,
+      Sign: signSha256(query, apiSecret),
+    },
+  });
+  const payload = unwrapOrder((await response.json()) as IndodaxV2OrderResponse);
+  if (isIndodaxErrorPayload(response, payload)) {
+    throw new OrderError(
+      "indodax",
+      payload.msg ?? `HTTP ${response.status} cancelling order ${orderId}`,
+    );
+  }
+  return payload;
+}
+
+function isFullyFilled(status: string, executedQtyEth: number, requestedQty: number): boolean {
+  if (isFilledStatus(status)) {
+    return executedQtyEth > 0;
+  }
+  return requestedQty > 0 && executedQtyEth >= requestedQty * 0.999;
+}
+
 async function resolveIndodaxFill(
   ack: IndodaxV2OrderResponse,
   requestedQty: number,
@@ -220,7 +254,7 @@ async function resolveIndodaxFill(
   executedQuoteUsdt: number;
   clientOrderId?: string;
 }> {
-  const pollWaitsMs = [0, 250, 500, 1000, 2000];
+  const pollWaitsMs = [0, 250, 500, 1000, 2000, 3000];
   let latest = unwrapOrder(ack);
 
   for (const waitMs of pollWaitsMs) {
@@ -238,15 +272,27 @@ async function resolveIndodaxFill(
     }
 
     const status = normalizeStatus(latest.status);
+    const executedQtyEth = executedQtyOf(latest, requestedQty);
     if (isRejectedStatus(status)) {
+      if (executedQtyEth > 0) {
+        return {
+          orderId: orderIdOf(latest) ?? "",
+          status,
+          executedQtyEth,
+          executedQuoteUsdt: positiveNumber(
+            latest.cummulativeQuoteQty,
+            latest.cumulativeQuoteQty,
+          ),
+          clientOrderId: latest.clientOrderId ?? latest.client_order_id,
+        };
+      }
       throw new OrderError(
         "indodax",
         `Order ${orderIdOf(latest)} ${status.toLowerCase()}`,
       );
     }
 
-    const executedQtyEth = executedQtyOf(latest, requestedQty);
-    if (executedQtyEth > 0 && status !== "NEW") {
+    if (isFullyFilled(status, executedQtyEth, requestedQty)) {
       return {
         orderId: orderIdOf(latest) ?? "",
         status: status || "FILLED",
@@ -258,6 +304,41 @@ async function resolveIndodaxFill(
         clientOrderId: latest.clientOrderId ?? latest.client_order_id,
       };
     }
+  }
+
+  const orderId = orderIdOf(latest);
+  if (orderId) {
+    try {
+      console.log(
+        `[Indodax] Order ${orderId} not fully filled, cancelling remainder`,
+      );
+      const cancelled = await cancelIndodaxOrder(orderId);
+      latest = unwrapOrder(cancelled);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      console.log(`[Indodax] Cancel ${orderId} failed (${message}), re-checking fill`);
+    }
+
+    try {
+      latest = await fetchIndodaxOrderDetail(orderId);
+    } catch {
+      // Use cancel/ACK payload already in `latest`.
+    }
+  }
+
+  const status = normalizeStatus(latest.status);
+  const executedQtyEth = executedQtyOf(latest, requestedQty);
+  if (isFullyFilled(status, executedQtyEth, requestedQty) || executedQtyEth > 0) {
+    return {
+      orderId: orderIdOf(latest) ?? orderId ?? "",
+      status: status || "PARTIAL",
+      executedQtyEth,
+      executedQuoteUsdt: positiveNumber(
+        latest.cummulativeQuoteQty,
+        latest.cumulativeQuoteQty,
+      ),
+      clientOrderId: latest.clientOrderId ?? latest.client_order_id,
+    };
   }
 
   throw new OrderError(

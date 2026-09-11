@@ -1,5 +1,9 @@
 import { createHmac } from "node:crypto";
-import { BINANCE_QTY_DECIMALS, BINANCE_SYMBOL } from "../config/market";
+import {
+  BINANCE_MIN_NOTIONAL_USD,
+  BINANCE_QTY_DECIMALS,
+  BINANCE_SYMBOL,
+} from "../config/market";
 import { requiredEnv } from "../config/env";
 import {
   formatDecimal,
@@ -17,6 +21,9 @@ const TIME_SYNC_INTERVAL_MS = 30 * 60 * 1000;
 let timeOffsetMs = 0;
 let lastSyncedAt = 0;
 let syncInFlight: Promise<void> | null = null;
+let minNotionalUsdt = BINANCE_MIN_NOTIONAL_USD;
+let filtersLoaded = false;
+let filtersInFlight: Promise<void> | null = null;
 
 interface BinanceBalance {
   asset: string;
@@ -96,6 +103,87 @@ async function ensureBinanceTimeSynced(force = false): Promise<void> {
 
 function binanceTimestamp(): string {
   return Math.floor(Date.now() + timeOffsetMs).toString();
+}
+
+interface BinanceSymbolFilter {
+  filterType?: string;
+  minNotional?: string;
+  applyMinToMarket?: boolean | string;
+  stepSize?: string;
+}
+
+interface BinanceExchangeInfo {
+  symbols?: Array<{
+    filters?: BinanceSymbolFilter[];
+  }>;
+}
+
+async function loadBinanceSymbolFilters(): Promise<void> {
+  const response = await fetch(
+    `${BINANCE_API_URL}/api/v3/exchangeInfo?symbol=${BINANCE_SYMBOL}`,
+  );
+  const payload = (await response.json()) as BinanceExchangeInfo;
+  if (!response.ok) {
+    throw new OrderError(
+      "binance",
+      `HTTP ${response.status} fetching ${BINANCE_SYMBOL} exchangeInfo`,
+    );
+  }
+
+  const filters = payload.symbols?.[0]?.filters ?? [];
+  const notional = filters.find(
+    (filter) =>
+      filter.filterType === "NOTIONAL" || filter.filterType === "MIN_NOTIONAL",
+  );
+  const parsed = Number(notional?.minNotional);
+  if (Number.isFinite(parsed) && parsed > 0) {
+    minNotionalUsdt = parsed;
+  }
+
+  const applyMin =
+    notional?.applyMinToMarket === true ||
+    notional?.applyMinToMarket === "true";
+  filtersLoaded = true;
+  console.log(
+    `[Binance] ${BINANCE_SYMBOL} minNotional $${minNotionalUsdt.toFixed(2)} (MARKET ${applyMin ? "enforced" : "not enforced"})`,
+  );
+}
+
+export async function ensureBinanceFilters(): Promise<void> {
+  if (filtersLoaded) {
+    return;
+  }
+  if (filtersInFlight) {
+    await filtersInFlight;
+    return;
+  }
+
+  filtersInFlight = loadBinanceSymbolFilters()
+    .catch((error) => {
+      const message = error instanceof Error ? error.message : String(error);
+      console.log(
+        `[Binance] exchangeInfo unavailable (${message}); using minNotional $${minNotionalUsdt.toFixed(2)}`,
+      );
+      filtersLoaded = true;
+    })
+    .finally(() => {
+      filtersInFlight = null;
+    });
+  await filtersInFlight;
+}
+
+export function getBinanceMinNotionalUsdt(): number {
+  return minNotionalUsdt;
+}
+
+export function binanceNotionalMeetsMinimum(
+  quantityEth: number,
+  price: number,
+): boolean {
+  if (!(quantityEth > 0) || !(price > 0)) {
+    return false;
+  }
+  return quantityEth * price >= minNotionalUsdt;
 }
 
 export async function fetchBinanceSpotBalances(): Promise<SpotBalances> {
@@ -189,6 +277,7 @@ async function placeBinanceMarketOrderUnlocked(
   request: MarketOrderRequest,
 ): Promise<PlacedOrder> {
   await ensureBinanceTimeSynced();
+  await ensureBinanceFilters();
 
   const place = async (): Promise<{
     response: Response;

@@ -1,10 +1,4 @@
-import {
-  INITIAL_BINANCE_ETH,
-  INITIAL_BINANCE_USDT,
-  INITIAL_INDODAX_ETH,
-  INITIAL_INDODAX_USDT,
-  MIN_BALANCE_PCT,
-} from "../config/trading";
+import { MIN_BALANCE_PCT } from "../config/trading";
 import { ArbitrageDirection } from "./progress";
 
 export interface WalletBalances {
@@ -176,11 +170,6 @@ export class WalletTracker {
   }
 }
 
-export function createWalletTracker(): WalletTracker {
-  return new WalletTracker({
-    binanceEth: INITIAL_BINANCE_ETH,
-    binanceUsdt: INITIAL_BINANCE_USDT,
-    indodaxEth: INITIAL_INDODAX_ETH,
-    indodaxUsdt: INITIAL_INDODAX_USDT,
-  });
+export function createWalletTracker(initial: WalletBalances): WalletTracker {
+  return new WalletTracker(initial);
 }

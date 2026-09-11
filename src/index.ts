@@ -6,11 +6,17 @@ import {
   INITIAL_INDODAX_ETH,
   INITIAL_INDODAX_USDT,
   LIVE_TRADING,
+  MAX_UNPAIRED_PAIRS,
   MIN_BALANCE_PCT,
   TRADE_LIMIT_USD,
 } from "./config/trading";
 import { subscribeBinanceOrderBook } from "./exchanges/binance";
-import { logExchangeBalances } from "./exchanges/balances";
+import {
+  fetchBothSpotBalances,
+  logExchangeBalances,
+  missingSpotApiKeys,
+} from "./exchanges/balances";
+import { ensureBinanceFilters } from "./exchanges/binanceTrade";
 import { subscribeIndodaxOrderBook } from "./exchanges/indodax";
 import { OrderBookQuote } from "./types/quote";
 import {
@@ -28,7 +34,7 @@ import {
   ArbitrageDirection,
   TradeProgressTracker,
 } from "./trading/progress";
-import { createWalletTracker, WalletTracker } from "./trading/wallet";
+import { createWalletTracker, WalletBalances, WalletTracker } from "./trading/wallet";
 
 interface SpreadResult {
   diff: number;
@@ -53,7 +59,7 @@ interface ArbitrageOpportunity {
 
 const quotes: Record<string, OrderBookQuote> = {};
 const tradeProgress = new TradeProgressTracker();
-const wallet = createWalletTracker();
+let wallet: WalletTracker;
 let lastSpreadKey = "";
 let spreadLogInFlight = false;
 
@@ -211,7 +217,7 @@ function getWalletSkipReason(
 }
 
 function logSpread(): void {
-  if (wallet.isHalted()) {
+  if (!wallet || wallet.isHalted()) {
     return;
   }
 
@@ -348,39 +354,87 @@ function logQuotes(exchange: string, quote: OrderBookQuote): void {
   logSpread();
 }
 
-subscribeBinanceOrderBook((quote) => {
-  logQuotes("Binance", quote);
+function envFallbackWalletBalances(): WalletBalances {
+  return {
+    binanceEth: INITIAL_BINANCE_ETH,
+    binanceUsdt: INITIAL_BINANCE_USDT,
+    indodaxEth: INITIAL_INDODAX_ETH,
+    indodaxUsdt: INITIAL_INDODAX_USDT,
+  };
+}
+
+async function loadStartupWalletBalances(): Promise<{
+  balances: WalletBalances;
+  source: "live" | "env";
+}> {
+  const missing = missingSpotApiKeys();
+  if (missing.length > 0) {
+    console.log(
+      `[Wallet] No API keys (${missing.join(", ")}); using INITIAL_* env fallback`,
+    );
+    return { balances: envFallbackWalletBalances(), source: "env" };
+  }
+
+  const { binance, indodax } = await fetchBothSpotBalances();
+  return {
+    source: "live",
+    balances: {
+      binanceEth: binance.eth,
+      binanceUsdt: binance.usdt,
+      indodaxEth: indodax.eth,
+      indodaxUsdt: indodax.usdt,
+    },
+  };
+}
+
+async function start(): Promise<void> {
+  console.log("Fetching Spot ETH/USDT balances from Binance and Indodax...");
+  assertLiveTradingCredentials();
+  if (LIVE_TRADING) {
+    await ensureBinanceFilters();
+  }
+
+  const startup = await loadStartupWalletBalances();
+  wallet = createWalletTracker(startup.balances);
+
+  console.log(
+    LIVE_TRADING
+      ? "Live trading: ON — real market orders will be placed"
+      : "Live trading: OFF — simulation only (set LIVE_TRADING=true to place real orders)",
+  );
+  console.log(
+    `Taker fees: Binance ${(TAKER_FEES.binance * 100).toFixed(4)}%, Indodax buy ${(TAKER_FEES.indodax.buy * 100).toFixed(4)}% / sell ${(TAKER_FEES.indodax.sell * 100).toFixed(4)}%`,
+  );
+  console.log(`Trade size: $${TRADE_LIMIT_USD.toFixed(2)} per execution`);
+  console.log(
+    `Unpaired pairs: keep running until ${MAX_UNPAIRED_PAIRS} (logged to unpaired-pair-trade.txt)`,
+  );
+  console.log(
+    `[Wallet] initial from ${startup.source}: ${wallet.formatBalances()}`,
+  );
+  console.log(
+    `Trading stops when any balance falls to ${(MIN_BALANCE_PCT * 100).toFixed(0)}% of initial`,
+  );
+
+  console.log("Subscribing to Ethereum order books on Binance and Indodax...");
+  subscribeBinanceOrderBook((quote) => {
+    logQuotes("Binance", quote);
+  });
+  subscribeIndodaxOrderBook((quote) => {
+    logQuotes("Indodax", quote);
+  });
+
+  const HEARTBEAT_INTERVAL_MS = 5 * 60 * 1000;
+  let elapsedMinutes = 0;
+  setInterval(() => {
+    elapsedMinutes += 5;
+    console.log(`${elapsedMinutes} minutes elapsed`);
+    void logExchangeBalances();
+  }, HEARTBEAT_INTERVAL_MS);
+}
+
+void start().catch((error) => {
+  const message = error instanceof Error ? error.message : String(error);
+  console.error(`[Start] Failed to seed wallet from live balances: ${message}`);
+  process.exit(1);
 });
-
-subscribeIndodaxOrderBook((quote) => {
-  logQuotes("Indodax", quote);
-});
-
-console.log("Subscribing to Ethereum order books on Binance and Indodax...");
-assertLiveTradingCredentials();
-console.log(
-  LIVE_TRADING
-    ? "Live trading: ON — real market orders will be placed"
-    : "Live trading: OFF — simulation only (set LIVE_TRADING=true to place real orders)",
-);
-console.log(
-  `Taker fees: Binance ${(TAKER_FEES.binance * 100).toFixed(4)}%, Indodax buy ${(TAKER_FEES.indodax.buy * 100).toFixed(4)}% / sell ${(TAKER_FEES.indodax.sell * 100).toFixed(4)}%`,
-);
-console.log(`Trade size: $${TRADE_LIMIT_USD.toFixed(2)} per execution`);
-console.log(
-  `Initial wallet: Binance ETH ${INITIAL_BINANCE_ETH}, USDT ${INITIAL_BINANCE_USDT} | Indodax ETH ${INITIAL_INDODAX_ETH}, USDT ${INITIAL_INDODAX_USDT}`,
-);
-console.log(
-  `Trading stops when any balance falls to ${(MIN_BALANCE_PCT * 100).toFixed(0)}% of initial`,
-);
-console.log(`[Wallet] ${wallet.formatBalances()}`);
-void logExchangeBalances();
-
-const HEARTBEAT_INTERVAL_MS = 5 * 60 * 1000;
-let elapsedMinutes = 0;
-
-setInterval(() => {
-  elapsedMinutes += 5;
-  console.log(`${elapsedMinutes} minutes elapsed`);
-  void logExchangeBalances();
-}, HEARTBEAT_INTERVAL_MS);
