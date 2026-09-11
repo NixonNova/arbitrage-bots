@@ -19,8 +19,10 @@ import {
   TradeOpportunity,
 } from "./trading/executor";
 import {
+  formatNotionalSkip,
   getRequiredEth,
   hasSufficientLiquidity,
+  hasSufficientTopOfBookNotional,
 } from "./trading/liquidity";
 import {
   ArbitrageDirection,
@@ -43,6 +45,8 @@ interface ArbitrageOpportunity {
   buyAskQty: number;
   sellBidPrice: number;
   sellBidQty: number;
+  buyAskPriceText: string;
+  sellBidPriceText: string;
   buyTakerFee: number;
   sellTakerFee: number;
 }
@@ -99,7 +103,13 @@ function buildTradeOpportunity(
   }
 
   if (
-    !hasSufficientLiquidity(buyAskPrice, buyAskQty, sellBidQty, TRADE_LIMIT_USD)
+    !hasSufficientLiquidity(
+      buyAskPrice,
+      buyAskQty,
+      sellBidPrice,
+      sellBidQty,
+      TRADE_LIMIT_USD,
+    )
   ) {
     return null;
   }
@@ -126,6 +136,10 @@ function buildTradeOpportunity(
     tradeNotionalUsd: TRADE_LIMIT_USD,
     buyAskPrice,
     sellBidPrice,
+    buyAskQty,
+    sellBidQty,
+    buyAskPriceText: opportunity.buyAskPriceText,
+    sellBidPriceText: opportunity.sellBidPriceText,
     buyTakerFee,
     sellTakerFee,
   };
@@ -138,21 +152,34 @@ function getLiquiditySkipReason(
     return null;
   }
 
-  const requiredEth = getRequiredEth(
-    opportunity.buyAskPrice,
-    TRADE_LIMIT_USD,
-  );
-
-  if (requiredEth <= 0) {
-    return `${opportunity.label}: invalid price`;
+  if (
+    !hasSufficientTopOfBookNotional(
+      opportunity.buyAskPrice,
+      opportunity.buyAskQty,
+      TRADE_LIMIT_USD,
+    )
+  ) {
+    return formatNotionalSkip(
+      opportunity.label,
+      "ask",
+      opportunity.buyAskPrice,
+      opportunity.buyAskQty,
+    );
   }
 
-  if (opportunity.buyAskQty < requiredEth) {
-    return `${opportunity.label}: insufficient ask liquidity`;
-  }
-
-  if (opportunity.sellBidQty < requiredEth) {
-    return `${opportunity.label}: insufficient bid liquidity`;
+  if (
+    !hasSufficientTopOfBookNotional(
+      opportunity.sellBidPrice,
+      opportunity.sellBidQty,
+      TRADE_LIMIT_USD,
+    )
+  ) {
+    return formatNotionalSkip(
+      opportunity.label,
+      "bid",
+      opportunity.sellBidPrice,
+      opportunity.sellBidQty,
+    );
   }
 
   return null;
@@ -184,6 +211,10 @@ function getWalletSkipReason(
 }
 
 function logSpread(): void {
+  if (wallet.isHalted()) {
+    return;
+  }
+
   void logSpreadAsync();
 }
 
@@ -219,6 +250,8 @@ async function logSpreadLocked(): Promise<void> {
       buyAskQty: Number(binance.bestAskQty),
       sellBidPrice: Number(indodax.bestBid),
       sellBidQty: Number(indodax.bestBidQty),
+      buyAskPriceText: binance.bestAsk,
+      sellBidPriceText: indodax.bestBid,
       buyTakerFee: TAKER_FEES.binance,
       sellTakerFee: TAKER_FEES.indodax.sell,
       spread: formatSpread(
@@ -235,6 +268,8 @@ async function logSpreadLocked(): Promise<void> {
       buyAskQty: Number(indodax.bestAskQty),
       sellBidPrice: Number(binance.bestBid),
       sellBidQty: Number(binance.bestBidQty),
+      buyAskPriceText: indodax.bestAsk,
+      sellBidPriceText: binance.bestBid,
       buyTakerFee: TAKER_FEES.indodax.buy,
       sellTakerFee: TAKER_FEES.binance,
       spread: formatSpread(
@@ -283,9 +318,7 @@ async function logSpreadLocked(): Promise<void> {
     skippedLabels.length > 0
       ? ` | [SKIPPED: ${skippedLabels.join(", ")}]`
       : "";
-  const haltedSuffix = wallet.isHalted()
-    ? ` | [HALTED: ${wallet.getHaltReason() ?? "trading stopped"}]`
-    : "";
+  const haltedSuffix = wallet.isHalted() ? " | [HALTED]" : "";
   const progressSuffix =
     tradeProgress.getTradeCount() > 0
       ? ` | ${tradeProgress.getSummary()}`

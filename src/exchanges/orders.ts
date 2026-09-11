@@ -5,6 +5,8 @@ export interface MarketOrderRequest {
   side: OrderSide;
   quantityEth: number;
   quoteAmountUsdt?: number;
+  limitPrice?: number;
+  limitPriceText?: string;
   clientOrderId: string;
 }
 
@@ -57,6 +59,11 @@ export async function withMarketOrderLock<T>(
 export function roundDown(value: number, decimals: number): number {
   const factor = 10 ** decimals;
   return Math.floor(value * factor + Number.EPSILON) / factor;
+}
+
+export function roundUp(value: number, decimals: number): number {
+  const factor = 10 ** decimals;
+  return Math.ceil(value * factor - Number.EPSILON) / factor;
 }
 
 export function formatDecimal(value: number, decimals: number): string {

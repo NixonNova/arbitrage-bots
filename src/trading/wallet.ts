@@ -57,6 +57,8 @@ export class WalletTracker {
     this.halted = true;
     this.haltReason = reason;
     console.error(`[Halt] Trading halted: ${reason}`);
+    console.error("[Halt] Stopping the bot so this error stays on screen. Restart after you review it.");
+    process.exit(1);
   }
 
   getBalances(): WalletBalances {

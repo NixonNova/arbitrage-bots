@@ -34,6 +34,10 @@ export interface TradeOpportunity {
   tradeNotionalUsd: number;
   buyAskPrice: number;
   sellBidPrice: number;
+  buyAskQty: number;
+  sellBidQty: number;
+  buyAskPriceText: string;
+  sellBidPriceText: string;
   buyTakerFee: number;
   sellTakerFee: number;
 }
@@ -81,11 +85,15 @@ async function placeMarketOrder(
   quantityEth: number,
   quoteAmountUsdt: number | undefined,
   clientOrderId: string,
+  limitPrice?: number,
+  limitPriceText?: string,
 ): Promise<PlacedOrder> {
   const request = {
     side,
     quantityEth,
     quoteAmountUsdt,
+    limitPrice,
+    limitPriceText,
     clientOrderId,
   };
 
@@ -104,12 +112,13 @@ function quantityForExchange(exchange: ExchangeName, eth: number): number {
 
 function haltUnpairedFill(
   wallet: WalletTracker,
-  buy: PlacedOrder,
-  sellExchange: ExchangeName,
+  first: PlacedOrder,
+  secondExchange: ExchangeName,
+  secondSide: "BUY" | "SELL",
   detail: string,
 ): void {
   const reason =
-    `unpaired pair: ${buy.exchange} BUY filled (order ${buy.orderId}, ${buy.executedQtyEth.toFixed(8)} ETH) but ${sellExchange} SELL failed (${detail})`;
+    `unpaired pair: ${first.exchange} ${first.side} filled (order ${first.orderId}, ${first.executedQtyEth.toFixed(8)} ETH) but ${secondExchange} ${secondSide} failed (${detail})`;
   console.error(`[Trade] CRITICAL: ${reason}`);
   wallet.halt(reason);
 }
@@ -117,76 +126,99 @@ function haltUnpairedFill(
 async function executeLivePair(
   opportunity: TradeOpportunity,
   wallet: WalletTracker,
-): Promise<{ buy: PlacedOrder; sell: PlacedOrder }> {
+): Promise<void> {
   const legs = DIRECTION_LEGS[opportunity.direction];
   const stamp = Date.now().toString(36);
-  const buyClientId = `arb1${stamp}`.slice(0, 36);
-  const sellClientId = `arb2${stamp}`.slice(0, 36);
+  const indodaxClientId = `arb1${stamp}`.slice(0, 36);
+  const binanceClientId = `arb2${stamp}`.slice(0, 36);
 
-  const buyQty = quantityForExchange(legs.buyExchange, opportunity.tradeSizeEth);
-  const plannedSellQty = quantityForExchange(legs.sellExchange, buyQty);
-  if (!(buyQty > 0)) {
+  const indodaxSide: "BUY" | "SELL" =
+    legs.buyExchange === "indodax" ? "BUY" : "SELL";
+  const binanceSide: "BUY" | "SELL" = indodaxSide === "BUY" ? "SELL" : "BUY";
+
+  const indodaxQty = quantityForExchange("indodax", opportunity.tradeSizeEth);
+  const binanceQty = quantityForExchange("binance", opportunity.tradeSizeEth);
+  if (!(indodaxQty > 0) || !(binanceQty > 0)) {
     throw new OrderError(
-      legs.buyExchange,
-      `Skipping buy: planned size ${opportunity.tradeSizeEth} ETH is below buy lot size`,
+      "indodax",
+      `Skipping pair: size ${opportunity.tradeSizeEth} ETH is below lot size`,
     );
   }
-  if (!(plannedSellQty > 0)) {
+
+  if (indodaxSide === "BUY" && indodaxQty > opportunity.buyAskQty) {
     throw new OrderError(
-      legs.sellExchange,
-      `Skipping pair: buy qty ${buyQty} ETH is below sell lot size`,
+      "indodax",
+      `Skipping buy: qty ${indodaxQty} ETH exceeds best-ask size ${opportunity.buyAskQty}`,
+    );
+  }
+  if (indodaxSide === "SELL" && indodaxQty > opportunity.sellBidQty) {
+    throw new OrderError(
+      "indodax",
+      `Skipping sell: qty ${indodaxQty} ETH exceeds best-bid size ${opportunity.sellBidQty}`,
     );
   }
 
   console.log(
-    `[Trade] Leg 1/2: ${legs.buyExchange} BUY ${buyQty.toFixed(8)} ETH (~$${opportunity.tradeNotionalUsd.toFixed(2)})`,
+    `[Trade] Leg 1/2: indodax ${indodaxSide} ${indodaxQty.toFixed(8)} ETH (~$${opportunity.tradeNotionalUsd.toFixed(2)})`,
   );
 
-  const buy = await placeMarketOrder(
-    legs.buyExchange,
-    "BUY",
-    buyQty,
-    opportunity.tradeNotionalUsd,
-    buyClientId,
+  const first = await placeMarketOrder(
+    "indodax",
+    indodaxSide,
+    indodaxQty,
+    indodaxSide === "BUY" ? opportunity.tradeNotionalUsd : undefined,
+    indodaxClientId,
+    indodaxSide === "BUY" ? opportunity.buyAskPrice : opportunity.sellBidPrice,
+    indodaxSide === "BUY" ? opportunity.buyAskPriceText : opportunity.sellBidPriceText,
   );
 
   console.log(
-    `[Trade] Leg 1 filled: ${buy.exchange} order ${buy.orderId} qty ${buy.executedQtyEth.toFixed(8)} ETH`,
+    `[Trade] Leg 1 filled: ${first.exchange} order ${first.orderId} qty ${first.executedQtyEth.toFixed(8)} ETH`,
   );
 
-  const filledBuyQty = quantityForExchange(legs.buyExchange, buy.executedQtyEth);
-  if (!(filledBuyQty > 0)) {
-    const detail = `buy fill ${buy.executedQtyEth} ETH is below buy lot size`;
-    haltUnpairedFill(wallet, buy, legs.sellExchange, detail);
-    throw new OrderError(legs.buyExchange, `Skipping sell: ${detail}`);
+  const filledIndodaxQty = quantityForExchange("indodax", first.executedQtyEth);
+  if (!(filledIndodaxQty > 0)) {
+    const detail = `Indodax fill ${first.executedQtyEth} ETH is below lot size`;
+    haltUnpairedFill(wallet, first, "binance", binanceSide, detail);
+    throw new OrderError("indodax", detail);
   }
 
-  const sellQty = quantityForExchange(legs.sellExchange, filledBuyQty);
-  if (!(sellQty > 0)) {
-    const detail = `buy fill ${buy.executedQtyEth} ETH is below sell lot size`;
-    haltUnpairedFill(wallet, buy, legs.sellExchange, detail);
-    throw new OrderError(legs.sellExchange, `Skipping sell: ${detail}`);
+  const secondQty = quantityForExchange("binance", filledIndodaxQty);
+  if (!(secondQty > 0)) {
+    const detail = `Indodax fill ${first.executedQtyEth} ETH is below Binance lot size`;
+    haltUnpairedFill(wallet, first, "binance", binanceSide, detail);
+    throw new OrderError("binance", detail);
+  }
+
+  if (binanceSide === "BUY" && secondQty > opportunity.buyAskQty) {
+    const detail = `buy qty ${secondQty} ETH exceeds best-ask size ${opportunity.buyAskQty}`;
+    haltUnpairedFill(wallet, first, "binance", binanceSide, detail);
+    throw new OrderError("binance", detail);
+  }
+  if (binanceSide === "SELL" && secondQty > opportunity.sellBidQty) {
+    const detail = `sell qty ${secondQty} ETH exceeds best-bid size ${opportunity.sellBidQty}`;
+    haltUnpairedFill(wallet, first, "binance", binanceSide, detail);
+    throw new OrderError("binance", detail);
   }
 
   console.log(
-    `[Trade] Leg 2/2: ${legs.sellExchange} SELL ${sellQty.toFixed(8)} ETH`,
+    `[Trade] Leg 2/2: binance ${binanceSide} ${secondQty.toFixed(8)} ETH`,
   );
 
   try {
-    const sell = await placeMarketOrder(
-      legs.sellExchange,
-      "SELL",
-      sellQty,
+    const second = await placeMarketOrder(
+      "binance",
+      binanceSide,
+      secondQty,
       undefined,
-      sellClientId,
+      binanceClientId,
     );
     console.log(
-      `[Trade] Leg 2 filled: ${sell.exchange} order ${sell.orderId} qty ${sell.executedQtyEth.toFixed(8)} ETH`,
+      `[Trade] Leg 2 filled: ${second.exchange} order ${second.orderId} qty ${second.executedQtyEth.toFixed(8)} ETH`,
     );
-    return { buy, sell };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    haltUnpairedFill(wallet, buy, legs.sellExchange, message);
+    haltUnpairedFill(wallet, first, "binance", binanceSide, message);
     throw error;
   }
 }

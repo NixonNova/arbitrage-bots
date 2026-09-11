@@ -1,9 +1,10 @@
 import { createHmac } from "node:crypto";
-import { INDODAX_PAIR, INDODAX_QTY_DECIMALS } from "../config/market";
+import { INDODAX_PAIR, INDODAX_PRICE_DECIMALS, INDODAX_QTY_DECIMALS } from "../config/market";
 import { requiredEnv } from "../config/env";
 import {
   formatDecimal,
   OrderError,
+  roundUp,
   withMarketOrderLock,
   type MarketOrderRequest,
   type PlacedOrder,
@@ -11,8 +12,14 @@ import {
 import type { SpotBalances } from "./balances";
 
 const INDODAX_TAPI_V2_URL = "https://api.indodax.com";
+const INDODAX_TIME_URL = "https://indodax.com/api/server_time";
 const INDODAX_TAPI_V2_SYMBOL = INDODAX_PAIR.replace("_", "");
-const USDT_DECIMALS = 2;
+const TIME_SYNC_INTERVAL_MS = 30 * 60 * 1000;
+/** USDT pairs reject MARKET. LIMIT at the quoted bid/ask takes without extra slip. */
+
+let timeOffsetMs = 0;
+let lastSyncedAt = 0;
+let syncInFlight: Promise<void> | null = null;
 
 interface IndodaxV2AccountResponse {
   balances?: Array<{ asset: string; free: string; locked: string }>;
@@ -22,10 +29,20 @@ interface IndodaxV2AccountResponse {
 
 interface IndodaxV2OrderResponse {
   orderId?: number | string;
+  order_id?: number | string;
   clientOrderId?: string;
+  client_order_id?: string;
   status?: string;
-  executedQty?: string;
-  cummulativeQuoteQty?: string;
+  executedQty?: string | number;
+  executed_qty?: string | number;
+  origQty?: string | number;
+  oriQty?: string | number;
+  filledQty?: string | number;
+  cummulativeQuoteQty?: string | number;
+  cumulativeQuoteQty?: string | number;
+  receive_eth?: string | number;
+  data?: IndodaxV2OrderResponse;
+  order?: IndodaxV2OrderResponse;
   code?: number;
   msg?: string;
 }
@@ -41,13 +58,238 @@ function signSha256(body: string, secret: string): string {
   return createHmac("sha256", secret).update(body).digest("hex");
 }
 
+function isTimestampError(message: string): boolean {
+  return /timestamp|recvWindow|recv window/i.test(message);
+}
+
+function normalizeServerTime(serverTime: number): number {
+  return serverTime < 1_000_000_000_000 ? serverTime * 1000 : serverTime;
+}
+
+async function syncIndodaxTime(): Promise<void> {
+  const sentAt = Date.now();
+  const response = await fetch(INDODAX_TIME_URL);
+  const receivedAt = Date.now();
+  const payload = (await response.json()) as { server_time?: number };
+
+  if (!response.ok || typeof payload.server_time !== "number") {
+    throw new OrderError(
+      "indodax",
+      `HTTP ${response.status} fetching server time`,
+    );
+  }
+
+  const localMid = Math.floor((sentAt + receivedAt) / 2);
+  timeOffsetMs = normalizeServerTime(payload.server_time) - localMid;
+  lastSyncedAt = receivedAt;
+  console.log(`[Indodax] Time offset ${timeOffsetMs}ms`);
+}
+
+async function ensureIndodaxTimeSynced(force = false): Promise<void> {
+  if (!force && lastSyncedAt > 0 && Date.now() - lastSyncedAt < TIME_SYNC_INTERVAL_MS) {
+    return;
+  }
+
+  if (syncInFlight) {
+    await syncInFlight;
+    if (!force || (lastSyncedAt > 0 && Date.now() - lastSyncedAt < 1_000)) {
+      return;
+    }
+  }
+
+  syncInFlight = syncIndodaxTime().finally(() => {
+    syncInFlight = null;
+  });
+  await syncInFlight;
+}
+
+function indodaxTimestamp(): string {
+  return Math.floor(Date.now() + timeOffsetMs).toString();
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function unwrapOrder(payload: IndodaxV2OrderResponse): IndodaxV2OrderResponse {
+  if (payload.data && (payload.data.orderId != null || payload.data.order_id != null || payload.data.status)) {
+    return payload.data;
+  }
+  if (payload.order && (payload.order.orderId != null || payload.order.order_id != null || payload.order.status)) {
+    return payload.order;
+  }
+  return payload;
+}
+
+function orderIdOf(payload: IndodaxV2OrderResponse): string | undefined {
+  const order = unwrapOrder(payload);
+  const id = order.orderId ?? order.order_id;
+  return id === undefined ? undefined : String(id);
+}
+
+function positiveNumber(...values: Array<string | number | undefined>): number {
+  for (const value of values) {
+    const parsed = Number(value);
+    if (Number.isFinite(parsed) && parsed > 0) {
+      return parsed;
+    }
+  }
+  return 0;
+}
+
+function normalizeStatus(status: string | undefined): string {
+  return (status ?? "").trim().toUpperCase();
+}
+
+function isFilledStatus(status: string): boolean {
+  return (
+    status === "FILLED" ||
+    status === "CLOSED" ||
+    status === "SELESAI" ||
+    status === "DONE"
+  );
+}
+
+function isRejectedStatus(status: string): boolean {
+  return (
+    status === "REJECTED" ||
+    status === "EXPIRED" ||
+    status === "CANCELLED" ||
+    status === "CANCELED"
+  );
+}
+
+function executedQtyOf(payload: IndodaxV2OrderResponse, requestedQty: number): number {
+  const order = unwrapOrder(payload);
+  const filled = positiveNumber(
+    order.executedQty,
+    order.executed_qty,
+    order.filledQty,
+    order.receive_eth,
+  );
+  if (filled > 0) {
+    return filled;
+  }
+
+  if (isFilledStatus(normalizeStatus(order.status))) {
+    return positiveNumber(order.origQty, order.oriQty, requestedQty);
+  }
+
+  return 0;
+}
+
+function isIndodaxErrorPayload(
+  response: Response,
+  payload: IndodaxV2OrderResponse,
+): boolean {
+  if (!response.ok) {
+    return true;
+  }
+  if (typeof payload.code === "number" && payload.code !== 0) {
+    return true;
+  }
+  return false;
+}
+
+async function fetchIndodaxOrderDetail(orderId: string): Promise<IndodaxV2OrderResponse> {
+  await ensureIndodaxTimeSynced();
+  const { apiKey, apiSecret } = getCredentials();
+  const query = new URLSearchParams({
+    symbol: INDODAX_TAPI_V2_SYMBOL,
+    orderId,
+    timestamp: indodaxTimestamp(),
+    recvWindow: "5000",
+  }).toString();
+  const response = await fetch(`${INDODAX_TAPI_V2_URL}/api/v2/order?${query}`, {
+    headers: {
+      Accept: "application/json",
+      "X-APIKEY": apiKey,
+      Sign: signSha256(query, apiSecret),
+    },
+  });
+  return unwrapOrder((await response.json()) as IndodaxV2OrderResponse);
+}
+
+async function resolveIndodaxFill(
+  ack: IndodaxV2OrderResponse,
+  requestedQty: number,
+): Promise<{
+  orderId: string;
+  status: string;
+  executedQtyEth: number;
+  executedQuoteUsdt: number;
+  clientOrderId?: string;
+}> {
+  const pollWaitsMs = [0, 250, 500, 1000, 2000];
+  let latest = unwrapOrder(ack);
+
+  for (const waitMs of pollWaitsMs) {
+    if (waitMs > 0) {
+      await sleep(waitMs);
+      const orderId = orderIdOf(latest);
+      if (!orderId) {
+        break;
+      }
+      try {
+        latest = await fetchIndodaxOrderDetail(orderId);
+      } catch {
+        continue;
+      }
+    }
+
+    const status = normalizeStatus(latest.status);
+    if (isRejectedStatus(status)) {
+      throw new OrderError(
+        "indodax",
+        `Order ${orderIdOf(latest)} ${status.toLowerCase()}`,
+      );
+    }
+
+    const executedQtyEth = executedQtyOf(latest, requestedQty);
+    if (executedQtyEth > 0 && status !== "NEW") {
+      return {
+        orderId: orderIdOf(latest) ?? "",
+        status: status || "FILLED",
+        executedQtyEth,
+        executedQuoteUsdt: positiveNumber(
+          latest.cummulativeQuoteQty,
+          latest.cumulativeQuoteQty,
+        ),
+        clientOrderId: latest.clientOrderId ?? latest.client_order_id,
+      };
+    }
+  }
+
+  throw new OrderError(
+    "indodax",
+    `Order ${orderIdOf(latest)} did not fill (status=${latest.status ?? "unknown"}, qty=${latest.executedQty ?? latest.executed_qty ?? "0"})`,
+  );
+}
+
+function takerLimitPrice(side: "BUY" | "SELL", request: MarketOrderRequest): string {
+  const exact = request.limitPriceText?.trim();
+  const referencePrice =
+    exact && Number(exact) > 0 ? Number(exact) : (request.limitPrice ?? 0);
+  if (!(referencePrice > 0)) {
+    throw new OrderError("indodax", "LIMIT order requires a top-of-book price");
+  }
+
+  if (side === "BUY") {
+    return roundUp(referencePrice, INDODAX_PRICE_DECIMALS).toFixed(
+      INDODAX_PRICE_DECIMALS,
+    );
+  }
+
+  return formatDecimal(referencePrice, INDODAX_PRICE_DECIMALS);
+}
+
 async function fetchIndodaxSpotBalancesV2(
   apiKey: string,
   apiSecret: string,
 ): Promise<SpotBalances> {
   const query = new URLSearchParams({
     omitZeroBalances: "true",
-    timestamp: Date.now().toString(),
+    timestamp: indodaxTimestamp(),
     recvWindow: "5000",
   }).toString();
   const response = await fetch(`${INDODAX_TAPI_V2_URL}/api/v2/account?${query}`, {
@@ -81,7 +323,19 @@ async function fetchIndodaxSpotBalancesV2(
 
 export async function fetchIndodaxSpotBalances(): Promise<SpotBalances> {
   const { apiKey, apiSecret } = getCredentials();
-  return fetchIndodaxSpotBalancesV2(apiKey, apiSecret);
+  await ensureIndodaxTimeSynced();
+
+  try {
+    return await fetchIndodaxSpotBalancesV2(apiKey, apiSecret);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (!isTimestampError(message)) {
+      throw error;
+    }
+
+    await ensureIndodaxTimeSynced(true);
+    return fetchIndodaxSpotBalancesV2(apiKey, apiSecret);
+  }
 }
 
 export async function placeIndodaxMarketOrder(
@@ -93,62 +347,77 @@ export async function placeIndodaxMarketOrder(
 async function placeIndodaxMarketOrderUnlocked(
   request: MarketOrderRequest,
 ): Promise<PlacedOrder> {
-  const { apiKey, apiSecret } = getCredentials();
-  const params = new URLSearchParams({
-    symbol: INDODAX_TAPI_V2_SYMBOL,
-    side: request.side,
-    type: "MARKET",
-    newClientOrderId: request.clientOrderId,
-    timestamp: Date.now().toString(),
-    recvWindow: "5000",
-  });
+  await ensureIndodaxTimeSynced();
 
-  if (request.side === "BUY") {
-    const quoteAmount = request.quoteAmountUsdt ?? 0;
-    if (!(quoteAmount > 0)) {
-      throw new OrderError("indodax", "Market buy requires a USDT quote amount");
-    }
-    params.set("quoteOrderQty", formatDecimal(quoteAmount, USDT_DECIMALS));
-  } else {
-    params.set("quantity", formatDecimal(request.quantityEth, INDODAX_QTY_DECIMALS));
+  const place = async (): Promise<{
+    response: Response;
+    payload: IndodaxV2OrderResponse;
+  }> => {
+    const { apiKey, apiSecret } = getCredentials();
+    const limitPrice = takerLimitPrice(request.side, request);
+    const params = new URLSearchParams({
+      symbol: INDODAX_TAPI_V2_SYMBOL,
+      side: request.side,
+      type: "LIMIT",
+      timeInForce: "GTC",
+      quantity: formatDecimal(request.quantityEth, INDODAX_QTY_DECIMALS),
+      price: limitPrice,
+      newClientOrderId: request.clientOrderId,
+      timestamp: indodaxTimestamp(),
+      recvWindow: "5000",
+    });
+
+    console.log(
+      `[Indodax] LIMIT ${request.side} ${formatDecimal(request.quantityEth, INDODAX_QTY_DECIMALS)} ETH @ ${limitPrice} USDT`,
+    );
+
+    const body = params.toString();
+    const response = await fetch(`${INDODAX_TAPI_V2_URL}/api/v2/order`, {
+      method: "POST",
+      headers: {
+        Accept: "application/json",
+        "Content-Type": "application/x-www-form-urlencoded",
+        "X-APIKEY": apiKey,
+        Sign: signSha256(body, apiSecret),
+      },
+      body,
+    });
+    const payload = unwrapOrder((await response.json()) as IndodaxV2OrderResponse);
+    return { response, payload };
+  };
+
+  let { response, payload } = await place();
+  if (isIndodaxErrorPayload(response, payload) && isTimestampError(payload.msg ?? "")) {
+    await ensureIndodaxTimeSynced(true);
+    ({ response, payload } = await place());
   }
-
-  const body = params.toString();
-  const response = await fetch(`${INDODAX_TAPI_V2_URL}/api/v2/order`, {
-    method: "POST",
-    headers: {
-      Accept: "application/json",
-      "Content-Type": "application/x-www-form-urlencoded",
-      "X-APIKEY": apiKey,
-      Sign: signSha256(body, apiSecret),
-    },
-    body,
-  });
-
-  const payload = (await response.json()) as IndodaxV2OrderResponse;
-  if (!response.ok || payload.code !== undefined || payload.orderId === undefined) {
+  if (isIndodaxErrorPayload(response, payload) || orderIdOf(payload) === undefined) {
     throw new OrderError(
       "indodax",
       payload.msg ?? `HTTP ${response.status} placing ${request.side} order`,
     );
   }
 
-  const executedQtyEth = Number(payload.executedQty ?? 0);
-  if (!(executedQtyEth > 0) || payload.status === "REJECTED" || payload.status === "EXPIRED") {
+  console.log(
+    `[Indodax] Order ACK ${orderIdOf(payload)} status=${payload.status ?? "unknown"} executedQty=${payload.executedQty ?? payload.executed_qty ?? "n/a"}`,
+  );
+
+  const filled = await resolveIndodaxFill(payload, request.quantityEth);
+  if (!(filled.executedQtyEth > 0)) {
     throw new OrderError(
       "indodax",
-      `Order ${payload.orderId} did not fill (status=${payload.status ?? "unknown"}, qty=${payload.executedQty ?? "0"})`,
+      `Order ${filled.orderId} did not fill (status=${filled.status}, qty=${filled.executedQtyEth})`,
     );
   }
 
   return {
     exchange: "indodax",
     side: request.side,
-    orderId: String(payload.orderId),
-    clientOrderId: payload.clientOrderId ?? request.clientOrderId,
-    status: payload.status ?? "UNKNOWN",
-    executedQtyEth,
-    executedQuoteUsdt: Number(payload.cummulativeQuoteQty ?? 0),
+    orderId: filled.orderId,
+    clientOrderId: filled.clientOrderId ?? request.clientOrderId,
+    status: filled.status,
+    executedQtyEth: filled.executedQtyEth,
+    executedQuoteUsdt: filled.executedQuoteUsdt,
   };
 }
 

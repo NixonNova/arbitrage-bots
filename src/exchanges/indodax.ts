@@ -23,6 +23,7 @@ interface OrderBookLevel {
   eth_volume?: string;
   btc_volume?: string;
   usdt_volume?: string;
+  idr_volume?: string;
 }
 
 interface OrderBookData {
@@ -31,12 +32,34 @@ interface OrderBookData {
   bid: OrderBookLevel[];
 }
 
+function parsePositive(value: string | undefined): number {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
+}
+
 function getEthVolume(level: OrderBookLevel | undefined): string | undefined {
   if (!level) {
     return undefined;
   }
 
-  return level.eth_volume ?? level.btc_volume;
+  const ethVolume = parsePositive(level.eth_volume);
+  if (ethVolume > 0) {
+    return level.eth_volume;
+  }
+
+  const baseVolume = parsePositive(level.btc_volume);
+  if (baseVolume > 0) {
+    return level.btc_volume;
+  }
+
+  const price = parsePositive(level.price);
+  const quoteVolume =
+    parsePositive(level.usdt_volume) || parsePositive(level.idr_volume);
+  if (price > 0 && quoteVolume > 0) {
+    return String(quoteVolume / price);
+  }
+
+  return undefined;
 }
 
 function parseIndodaxMessages(raw: string): object[] {
