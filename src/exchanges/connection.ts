@@ -2,6 +2,9 @@ export const HEALTH_CHECK_INTERVAL_MS = 15_000;
 export const INDODAX_PING_INTERVAL_MS = 20_000;
 export const INDODAX_PING_TIMEOUT_MS = 15_000;
 export const BINANCE_SERVER_PING_STALE_MS = 70_000;
+/** Official: server closes if the client sends nothing for 60s. */
+export const HYPERLIQUID_PING_INTERVAL_MS = 30_000;
+export const HYPERLIQUID_INBOUND_STALE_MS = 70_000;
 
 const RECONNECT_DELAYS_MS = [3_000, 5_000, 10_000, 20_000, 60_000];
 

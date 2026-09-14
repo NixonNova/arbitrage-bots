@@ -1,11 +1,15 @@
-import { MIN_BALANCE_PCT } from "../config/trading";
-import { ArbitrageDirection } from "./progress";
+import { isExchangeActive, isExchangeLive, MIN_BALANCE_PCT } from "../config/trading";
+import { parseDirection, VENUE_LABELS, type ArbitrageDirection, type VenueId } from "./venues";
 
 export interface WalletBalances {
   binanceEth: number;
   binanceUsdt: number;
   indodaxEth: number;
   indodaxUsdt: number;
+  hyperliquidEth: number;
+  hyperliquidUsdt: number;
+  tokocryptoEth: number;
+  tokocryptoUsdt: number;
 }
 
 export interface TradeSettlement {
@@ -22,6 +26,33 @@ const BALANCE_LABELS: Record<keyof WalletBalances, string> = {
   binanceUsdt: "Binance USDT",
   indodaxEth: "Indodax ETH",
   indodaxUsdt: "Indodax USDT",
+  hyperliquidEth: "Hyperliquid ETH",
+  hyperliquidUsdt: "Hyperliquid USDC",
+  tokocryptoEth: "Tokocrypto ETH",
+  tokocryptoUsdt: "Tokocrypto USDT",
+};
+
+const LIVE_HALT_KEYS: (keyof WalletBalances)[] = [
+  "binanceEth",
+  "binanceUsdt",
+  "indodaxEth",
+  "indodaxUsdt",
+  "hyperliquidEth",
+  "hyperliquidUsdt",
+];
+
+const ETH_KEYS: Record<VenueId, keyof WalletBalances> = {
+  binance: "binanceEth",
+  indodax: "indodaxEth",
+  hyperliquid: "hyperliquidEth",
+  tokocrypto: "tokocryptoEth",
+};
+
+const USDT_KEYS: Record<VenueId, keyof WalletBalances> = {
+  binance: "binanceUsdt",
+  indodax: "indodaxUsdt",
+  hyperliquid: "hyperliquidUsdt",
+  tokocrypto: "tokocryptoUsdt",
 };
 
 export class WalletTracker {
@@ -59,6 +90,10 @@ export class WalletTracker {
     return { ...this.current };
   }
 
+  getInitialBalances(): WalletBalances {
+    return { ...this.initial };
+  }
+
   canExecute(settlement: TradeSettlement): boolean {
     if (this.halted) {
       return false;
@@ -70,16 +105,10 @@ export class WalletTracker {
       (1 + settlement.buyTakerFee);
     const sellEth = settlement.tradeSizeEth;
 
-    if (settlement.direction === "buy-binance-sell-indodax") {
-      return (
-        this.current.binanceUsdt >= buyCostUsdt &&
-        this.current.indodaxEth >= sellEth
-      );
-    }
-
+    const { buyVenue, sellVenue } = parseDirection(settlement.direction);
     return (
-      this.current.indodaxUsdt >= buyCostUsdt &&
-      this.current.binanceEth >= sellEth
+      this.current[USDT_KEYS[buyVenue]] >= buyCostUsdt &&
+      this.current[ETH_KEYS[sellVenue]] >= sellEth
     );
   }
 
@@ -94,21 +123,13 @@ export class WalletTracker {
       (1 + settlement.buyTakerFee);
     const sellEth = settlement.tradeSizeEth;
 
-    if (settlement.direction === "buy-binance-sell-indodax") {
-      if (this.current.binanceUsdt < buyCostUsdt) {
-        return "insufficient Binance USDT";
-      }
-      if (this.current.indodaxEth < sellEth) {
-        return "insufficient Indodax ETH";
-      }
-      return null;
+    const { buyVenue, sellVenue } = parseDirection(settlement.direction);
+    if (this.current[USDT_KEYS[buyVenue]] < buyCostUsdt) {
+      const quote = buyVenue === "hyperliquid" ? "USDC" : "USDT";
+      return `insufficient ${VENUE_LABELS[buyVenue]} ${quote}`;
     }
-
-    if (this.current.indodaxUsdt < buyCostUsdt) {
-      return "insufficient Indodax USDT";
-    }
-    if (this.current.binanceEth < sellEth) {
-      return "insufficient Binance ETH";
+    if (this.current[ETH_KEYS[sellVenue]] < sellEth) {
+      return `insufficient ${VENUE_LABELS[sellVenue]} ETH`;
     }
 
     return null;
@@ -125,17 +146,11 @@ export class WalletTracker {
       (1 - settlement.sellTakerFee);
     const tradeEth = settlement.tradeSizeEth;
 
-    if (settlement.direction === "buy-binance-sell-indodax") {
-      this.current.binanceUsdt -= buyCostUsdt;
-      this.current.binanceEth += tradeEth;
-      this.current.indodaxEth -= tradeEth;
-      this.current.indodaxUsdt += sellProceedsUsdt;
-    } else {
-      this.current.indodaxUsdt -= buyCostUsdt;
-      this.current.indodaxEth += tradeEth;
-      this.current.binanceEth -= tradeEth;
-      this.current.binanceUsdt += sellProceedsUsdt;
-    }
+    const { buyVenue, sellVenue } = parseDirection(settlement.direction);
+    this.current[USDT_KEYS[buyVenue]] -= buyCostUsdt;
+    this.current[ETH_KEYS[buyVenue]] += tradeEth;
+    this.current[ETH_KEYS[sellVenue]] -= tradeEth;
+    this.current[USDT_KEYS[sellVenue]] += sellProceedsUsdt;
 
     this.checkAndHalt();
   }
@@ -145,7 +160,22 @@ export class WalletTracker {
       return;
     }
 
-    for (const key of Object.keys(this.initial) as (keyof WalletBalances)[]) {
+    for (const key of LIVE_HALT_KEYS) {
+      if (key === "binanceEth" || key === "binanceUsdt") {
+        if (!isExchangeLive("binance")) {
+          continue;
+        }
+      }
+      if (key === "indodaxEth" || key === "indodaxUsdt") {
+        if (!isExchangeLive("indodax")) {
+          continue;
+        }
+      }
+      if (key === "hyperliquidEth" || key === "hyperliquidUsdt") {
+        if (!isExchangeLive("hyperliquid")) {
+          continue;
+        }
+      }
       const initialBalance = this.initial[key];
       if (initialBalance <= 0) {
         continue;
@@ -161,12 +191,29 @@ export class WalletTracker {
   }
 
   formatBalances(): string {
-    return [
-      `Binance ETH ${this.current.binanceEth.toFixed(8)}`,
-      `USDT ${this.current.binanceUsdt.toFixed(2)}`,
-      `| Indodax ETH ${this.current.indodaxEth.toFixed(8)}`,
-      `USDT ${this.current.indodaxUsdt.toFixed(2)}`,
-    ].join(" ");
+    const parts: string[] = [];
+    if (isExchangeActive("binance")) {
+      parts.push(
+        `Binance ETH ${this.current.binanceEth.toFixed(8)} USDT ${this.current.binanceUsdt.toFixed(2)}`,
+      );
+    }
+    if (isExchangeActive("indodax")) {
+      parts.push(
+        `Indodax ETH ${this.current.indodaxEth.toFixed(8)} USDT ${this.current.indodaxUsdt.toFixed(2)}`,
+      );
+    }
+    if (isExchangeActive("hyperliquid")) {
+      const tag = isExchangeLive("hyperliquid") ? "Hyperliquid" : "Hyperliquid (sim)";
+      parts.push(
+        `${tag} ETH ${this.current.hyperliquidEth.toFixed(8)} USDC ${this.current.hyperliquidUsdt.toFixed(2)}`,
+      );
+    }
+    if (isExchangeActive("tokocrypto")) {
+      parts.push(
+        `Tokocrypto (sim) ETH ${this.current.tokocryptoEth.toFixed(8)} USDT ${this.current.tokocryptoUsdt.toFixed(2)}`,
+      );
+    }
+    return parts.join(" | ");
   }
 }
 

@@ -1,4 +1,4 @@
-export type ExchangeName = "binance" | "indodax";
+export type ExchangeName = "binance" | "indodax" | "hyperliquid";
 export type OrderSide = "BUY" | "SELL";
 
 export interface MarketOrderRequest {

@@ -1,3 +1,4 @@
+import { isExchangeLive } from "../config/trading";
 import { optionalEnv } from "../config/env";
 import { fetchBinanceSpotBalances } from "./binanceTrade";
 import { fetchIndodaxSpotBalances } from "./indodaxTrade";
@@ -12,15 +13,23 @@ export interface BothSpotBalances {
   indodax: SpotBalances;
 }
 
-const SPOT_API_KEYS = [
-  "BINANCE_API_KEY",
-  "BINANCE_API_SECRET",
-  "INDODAX_API_KEY",
-  "INDODAX_API_SECRET",
-] as const;
+const LIVE_SPOT_VENUES = ["binance", "indodax"] as const;
+
+const SPOT_API_KEYS: Record<(typeof LIVE_SPOT_VENUES)[number], readonly string[]> = {
+  binance: ["BINANCE_API_KEY", "BINANCE_API_SECRET"],
+  indodax: ["INDODAX_API_KEY", "INDODAX_API_SECRET"],
+};
+
+const EMPTY_SPOT: SpotBalances = { eth: 0, usdt: 0 };
+
+export function includedLiveSpotVenues(): Array<(typeof LIVE_SPOT_VENUES)[number]> {
+  return LIVE_SPOT_VENUES.filter((venue) => isExchangeLive(venue));
+}
 
 export function missingSpotApiKeys(): string[] {
-  return SPOT_API_KEYS.filter((name) => !optionalEnv(name));
+  return includedLiveSpotVenues()
+    .flatMap((venue) => SPOT_API_KEYS[venue])
+    .filter((name) => !optionalEnv(name));
 }
 
 export function formatSpotBalances(balances: SpotBalances): string {
@@ -33,15 +42,22 @@ export async function fetchBothSpotBalances(): Promise<BothSpotBalances> {
     throw new Error(`missing ${missing.join(", ")}`);
   }
 
+  const includeBinance = isExchangeLive("binance");
+  const includeIndodax = isExchangeLive("indodax");
   const [binance, indodax] = await Promise.all([
-    fetchBinanceSpotBalances(),
-    fetchIndodaxSpotBalances(),
+    includeBinance ? fetchBinanceSpotBalances() : Promise.resolve(EMPTY_SPOT),
+    includeIndodax ? fetchIndodaxSpotBalances() : Promise.resolve(EMPTY_SPOT),
   ]);
 
   return { binance, indodax };
 }
 
 export async function logExchangeBalances(): Promise<void> {
+  const included = includedLiveSpotVenues();
+  if (included.length === 0) {
+    return;
+  }
+
   const missing = missingSpotApiKeys();
   if (missing.length > 0) {
     console.log(`[Balance] Skipped: missing ${missing.join(", ")}`);
@@ -49,18 +65,30 @@ export async function logExchangeBalances(): Promise<void> {
   }
 
   const [binance, indodax] = await Promise.allSettled([
-    fetchBinanceSpotBalances(),
-    fetchIndodaxSpotBalances(),
+    isExchangeLive("binance")
+      ? fetchBinanceSpotBalances()
+      : Promise.resolve(EMPTY_SPOT),
+    isExchangeLive("indodax")
+      ? fetchIndodaxSpotBalances()
+      : Promise.resolve(EMPTY_SPOT),
   ]);
 
-  const binanceLabel =
-    binance.status === "fulfilled"
-      ? formatSpotBalances(binance.value)
-      : `error: ${binance.reason instanceof Error ? binance.reason.message : String(binance.reason)}`;
-  const indodaxLabel =
-    indodax.status === "fulfilled"
-      ? formatSpotBalances(indodax.value)
-      : `error: ${indodax.reason instanceof Error ? indodax.reason.message : String(indodax.reason)}`;
+  const parts: string[] = [];
+  if (isExchangeLive("binance")) {
+    parts.push(`Binance ${settledSpotLabel(binance)}`);
+  }
+  if (isExchangeLive("indodax")) {
+    parts.push(`Indodax ${settledSpotLabel(indodax)}`);
+  }
 
-  console.log(`[Balance] Binance ${binanceLabel} | Indodax ${indodaxLabel}`);
+  console.log(`[Balance] ${parts.join(" | ")}`);
+}
+
+function settledSpotLabel(
+  result: PromiseSettledResult<SpotBalances>,
+): string {
+  if (result.status === "fulfilled") {
+    return formatSpotBalances(result.value);
+  }
+  return `error: ${result.reason instanceof Error ? result.reason.message : String(result.reason)}`;
 }

@@ -83,7 +83,7 @@ async function syncBinanceTime(): Promise<void> {
   console.log(`[Binance] Time offset ${timeOffsetMs}ms`);
 }
 
-async function ensureBinanceTimeSynced(force = false): Promise<void> {
+export async function ensureBinanceTimeSynced(force = false): Promise<void> {
   if (!force && lastSyncedAt > 0 && Date.now() - lastSyncedAt < TIME_SYNC_INTERVAL_MS) {
     return;
   }
@@ -101,8 +101,16 @@ async function ensureBinanceTimeSynced(force = false): Promise<void> {
   await syncInFlight;
 }
 
-function binanceTimestamp(): string {
+export function binanceTimestamp(): string {
   return Math.floor(Date.now() + timeOffsetMs).toString();
+}
+
+export function signBinanceQuery(query: string, secret: string): string {
+  return sign(query, secret);
+}
+
+export function getBinanceCredentials(): { apiKey: string; apiSecret: string } {
+  return getCredentials();
 }
 
 interface BinanceSymbolFilter {

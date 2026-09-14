@@ -3,3 +3,6 @@ dist/
 *.log
 .env
 unpaired-pair-trade.txt
+__pycache__/
+.venv/
+*.pyc

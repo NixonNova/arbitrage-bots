@@ -1,9 +1,15 @@
 import {
   BINANCE_QTY_DECIMALS,
+  HYPERLIQUID_MIN_NOTIONAL_USDC,
   INDODAX_PRICE_DECIMALS,
   INDODAX_QTY_DECIMALS,
 } from "../config/market";
-import { LIVE_TRADING, MAX_UNPAIRED_PAIRS, TRADE_LIMIT_USD } from "../config/trading";
+import {
+  isExchangeLive,
+  LIVE_TRADING,
+  MAX_UNPAIRED_PAIRS,
+  TRADE_LIMIT_USD,
+} from "../config/trading";
 import { optionalEnv } from "../config/env";
 import {
   placeBinanceMarketOrder,
@@ -14,6 +20,16 @@ import {
 import { fetchIndodaxTopOfBook } from "../exchanges/indodax";
 import { placeIndodaxMarketOrder } from "../exchanges/indodaxTrade";
 import {
+  ensureHyperliquidMeta,
+  fetchHyperliquidTopOfBook,
+  formatHyperliquidPrice,
+  getHyperliquidMinNotionalUsdc,
+  getHyperliquidSzDecimals,
+  hasHyperliquidCredentials,
+  hyperliquidNotionalMeetsMinimum,
+  placeHyperliquidIocOrder,
+} from "../exchanges/hyperliquidTrade";
+import {
   OrderError,
   isMarketOrderInFlight,
   roundDown,
@@ -21,18 +37,19 @@ import {
   type PlacedOrder,
 } from "../exchanges/orders";
 import {
-  ArbitrageDirection,
   createExecutedTrade,
   ExecutedTrade,
   TradeProgressTracker,
 } from "./progress";
 import { WalletTracker } from "./wallet";
 import { recordUnpairedPair } from "./unpaired";
-
-const DIRECTION_LABELS: Record<ArbitrageDirection, string> = {
-  "buy-binance-sell-indodax": "Buy Binance / Sell Indodax",
-  "buy-indodax-sell-binance": "Buy Indodax / Sell Binance",
-};
+import {
+  directionLabel,
+  isLiveTradablePair,
+  isPaperSimVenue,
+  parseDirection,
+  type ArbitrageDirection,
+} from "./venues";
 
 export interface TradeOpportunity {
   direction: ArbitrageDirection;
@@ -50,21 +67,24 @@ export interface TradeOpportunity {
   sellTakerFee: number;
 }
 
-interface ArbLegs {
-  buyExchange: ExchangeName;
-  sellExchange: ExchangeName;
+const FIRST_LEG_PRIORITY: ExchangeName[] = [
+  "indodax",
+  "hyperliquid",
+  "binance",
+];
+
+function asLiveExchange(venue: string): ExchangeName {
+  if (venue === "binance" || venue === "indodax" || venue === "hyperliquid") {
+    return venue;
+  }
+  throw new OrderError("binance", `No live orders for ${venue}`);
 }
 
-const DIRECTION_LEGS: Record<ArbitrageDirection, ArbLegs> = {
-  "buy-binance-sell-indodax": {
-    buyExchange: "binance",
-    sellExchange: "indodax",
-  },
-  "buy-indodax-sell-binance": {
-    buyExchange: "indodax",
-    sellExchange: "binance",
-  },
-};
+function pickFirstLeg(left: ExchangeName, right: ExchangeName): ExchangeName {
+  return FIRST_LEG_PRIORITY.indexOf(left) <= FIRST_LEG_PRIORITY.indexOf(right)
+    ? left
+    : right;
+}
 
 let executionInFlight = false;
 
@@ -73,12 +93,18 @@ export function assertLiveTradingCredentials(): void {
     return;
   }
 
-  const missing = [
-    "BINANCE_API_KEY",
-    "BINANCE_API_SECRET",
-    "INDODAX_API_KEY",
-    "INDODAX_API_SECRET",
-  ].filter((name) => !optionalEnv(name));
+  const required: string[] = [];
+  if (isExchangeLive("binance")) {
+    required.push("BINANCE_API_KEY", "BINANCE_API_SECRET");
+  }
+  if (isExchangeLive("indodax")) {
+    required.push("INDODAX_API_KEY", "INDODAX_API_SECRET");
+  }
+  if (isExchangeLive("hyperliquid") && optionalEnv("HYPERLIQUID_PRIVATE_KEY")) {
+    required.push("HYPERLIQUID_PRIVATE_KEY");
+  }
+
+  const missing = required.filter((name) => !optionalEnv(name));
 
   if (missing.length > 0) {
     throw new Error(
@@ -108,18 +134,33 @@ async function placeMarketOrder(
   if (exchange === "binance") {
     return placeBinanceMarketOrder(request);
   }
+  if (exchange === "hyperliquid") {
+    return placeHyperliquidIocOrder(request);
+  }
 
   return placeIndodaxMarketOrder(request);
 }
 
 function quantityForExchange(exchange: ExchangeName, eth: number): number {
   const decimals =
-    exchange === "binance" ? BINANCE_QTY_DECIMALS : INDODAX_QTY_DECIMALS;
+    exchange === "binance"
+      ? BINANCE_QTY_DECIMALS
+      : exchange === "hyperliquid"
+        ? getHyperliquidSzDecimals()
+        : INDODAX_QTY_DECIMALS;
   return roundDown(eth, decimals);
 }
 
 function sameLimitPrice(livePrice: number, plannedPrice: number): boolean {
   return livePrice.toFixed(INDODAX_PRICE_DECIMALS) === plannedPrice.toFixed(INDODAX_PRICE_DECIMALS);
+}
+
+function sameHyperliquidPrice(livePrice: number, plannedPrice: number): boolean {
+  const szDecimals = getHyperliquidSzDecimals();
+  return (
+    formatHyperliquidPrice(livePrice, szDecimals) ===
+    formatHyperliquidPrice(plannedPrice, szDecimals)
+  );
 }
 
 async function assertIndodaxFirstRowStillCovers(
@@ -158,6 +199,61 @@ async function assertIndodaxFirstRowStillCovers(
   }
 }
 
+async function assertHyperliquidFirstRowStillCovers(
+  side: "BUY" | "SELL",
+  quantityEth: number,
+  plannedPrice: number,
+): Promise<void> {
+  let live;
+  try {
+    live = await fetchHyperliquidTopOfBook();
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    throw new OrderError("hyperliquid", `Skipping ${side}: last-look depth failed (${message})`);
+  }
+  const livePrice = side === "BUY" ? live.bestAskPrice : live.bestBidPrice;
+  const liveQty = side === "BUY" ? live.bestAskQty : live.bestBidQty;
+  const liveNotional = livePrice * liveQty;
+  const bookSide = side === "BUY" ? "ask" : "bid";
+
+  console.log(
+    `[Hyperliquid] Last look first ${bookSide}: ${liveQty} ETH @ ${livePrice} ($${liveNotional.toFixed(2)})`,
+  );
+
+  if (!sameHyperliquidPrice(livePrice, plannedPrice)) {
+    throw new OrderError(
+      "hyperliquid",
+      `Skipping ${side}: first ${bookSide} moved ${plannedPrice} → ${livePrice}`,
+    );
+  }
+
+  if (
+    liveQty < quantityEth ||
+    liveNotional < TRADE_LIMIT_USD ||
+    liveNotional < HYPERLIQUID_MIN_NOTIONAL_USDC
+  ) {
+    throw new OrderError(
+      "hyperliquid",
+      `Skipping ${side}: first ${bookSide} now ${liveQty} ETH ($${liveNotional.toFixed(2)}) < ${quantityEth} ETH / $${TRADE_LIMIT_USD.toFixed(2)}`,
+    );
+  }
+}
+
+async function assertFirstRowStillCovers(
+  exchange: ExchangeName,
+  side: "BUY" | "SELL",
+  quantityEth: number,
+  plannedPrice: number,
+): Promise<void> {
+  if (exchange === "indodax") {
+    await assertIndodaxFirstRowStillCovers(side, quantityEth, plannedPrice);
+    return;
+  }
+  if (exchange === "hyperliquid") {
+    await assertHyperliquidFirstRowStillCovers(side, quantityEth, plannedPrice);
+  }
+}
+
 function haltUnpairedFill(
   wallet: WalletTracker,
   first: PlacedOrder,
@@ -179,116 +275,143 @@ async function executeLivePair(
   opportunity: TradeOpportunity,
   wallet: WalletTracker,
 ): Promise<void> {
-  const legs = DIRECTION_LEGS[opportunity.direction];
+  const parsed = parseDirection(opportunity.direction);
+  if (!isLiveTradablePair(parsed.buyVenue, parsed.sellVenue)) {
+    throw new OrderError("binance", `No live orders for ${directionLabel(opportunity.direction)}`);
+  }
+
+  const buy = asLiveExchange(parsed.buyVenue);
+  const sell = asLiveExchange(parsed.sellVenue);
+  if (buy === "hyperliquid" || sell === "hyperliquid") {
+    await ensureHyperliquidMeta();
+  }
+
+  const first = pickFirstLeg(buy, sell);
+  const second = first === buy ? sell : buy;
+  const firstSide: "BUY" | "SELL" = first === buy ? "BUY" : "SELL";
+  const secondSide: "BUY" | "SELL" = firstSide === "BUY" ? "SELL" : "BUY";
+
   const stamp = Date.now().toString(36);
-  const indodaxClientId = `arb1${stamp}`.slice(0, 36);
-  const binanceClientId = `arb2${stamp}`.slice(0, 36);
+  const firstClientId = `arb1${stamp}`.slice(0, 36);
+  const secondClientId = `arb2${stamp}`.slice(0, 36);
 
-  const indodaxSide: "BUY" | "SELL" =
-    legs.buyExchange === "indodax" ? "BUY" : "SELL";
-  const binanceSide: "BUY" | "SELL" = indodaxSide === "BUY" ? "SELL" : "BUY";
-
-  const indodaxQty = quantityForExchange("indodax", opportunity.tradeSizeEth);
-  const binanceQty = quantityForExchange("binance", opportunity.tradeSizeEth);
-  if (!(indodaxQty > 0) || !(binanceQty > 0)) {
+  const firstQty = quantityForExchange(first, opportunity.tradeSizeEth);
+  const secondQtyPlanned = quantityForExchange(second, opportunity.tradeSizeEth);
+  if (!(firstQty > 0) || !(secondQtyPlanned > 0)) {
     throw new OrderError(
-      "indodax",
+      first,
       `Skipping pair: size ${opportunity.tradeSizeEth} ETH is below lot size`,
     );
   }
 
-  if (indodaxSide === "BUY" && indodaxQty > opportunity.buyAskQty) {
+  if (firstSide === "BUY" && firstQty > opportunity.buyAskQty) {
     throw new OrderError(
-      "indodax",
-      `Skipping buy: qty ${indodaxQty} ETH exceeds best-ask size ${opportunity.buyAskQty}`,
+      first,
+      `Skipping buy: qty ${firstQty} ETH exceeds best-ask size ${opportunity.buyAskQty}`,
     );
   }
-  if (indodaxSide === "SELL" && indodaxQty > opportunity.sellBidQty) {
+  if (firstSide === "SELL" && firstQty > opportunity.sellBidQty) {
     throw new OrderError(
-      "indodax",
-      `Skipping sell: qty ${indodaxQty} ETH exceeds best-bid size ${opportunity.sellBidQty}`,
+      first,
+      `Skipping sell: qty ${firstQty} ETH exceeds best-bid size ${opportunity.sellBidQty}`,
     );
   }
 
-  const plannedIndodaxPrice =
-    indodaxSide === "BUY" ? opportunity.buyAskPrice : opportunity.sellBidPrice;
-  await assertIndodaxFirstRowStillCovers(
-    indodaxSide,
-    indodaxQty,
-    plannedIndodaxPrice,
+  const plannedFirstPrice =
+    firstSide === "BUY" ? opportunity.buyAskPrice : opportunity.sellBidPrice;
+  await assertFirstRowStillCovers(first, firstSide, firstQty, plannedFirstPrice);
+
+  console.log(
+    `[Trade] Leg 1/2: ${first} ${firstSide} ${firstQty.toFixed(8)} ETH (~$${opportunity.tradeNotionalUsd.toFixed(2)})`,
+  );
+
+  const firstFill = await placeMarketOrder(
+    first,
+    firstSide,
+    firstQty,
+    firstSide === "BUY" ? opportunity.tradeNotionalUsd : undefined,
+    firstClientId,
+    firstSide === "BUY" ? opportunity.buyAskPrice : opportunity.sellBidPrice,
+    firstSide === "BUY" ? opportunity.buyAskPriceText : opportunity.sellBidPriceText,
   );
 
   console.log(
-    `[Trade] Leg 1/2: indodax ${indodaxSide} ${indodaxQty.toFixed(8)} ETH (~$${opportunity.tradeNotionalUsd.toFixed(2)})`,
+    `[Trade] Leg 1 filled: ${firstFill.exchange} order ${firstFill.orderId} qty ${firstFill.executedQtyEth.toFixed(8)} ETH`,
   );
 
-  const first = await placeMarketOrder(
-    "indodax",
-    indodaxSide,
-    indodaxQty,
-    indodaxSide === "BUY" ? opportunity.tradeNotionalUsd : undefined,
-    indodaxClientId,
-    indodaxSide === "BUY" ? opportunity.buyAskPrice : opportunity.sellBidPrice,
-    indodaxSide === "BUY" ? opportunity.buyAskPriceText : opportunity.sellBidPriceText,
-  );
-
-  console.log(
-    `[Trade] Leg 1 filled: ${first.exchange} order ${first.orderId} qty ${first.executedQtyEth.toFixed(8)} ETH`,
-  );
-
-  const filledIndodaxQty = quantityForExchange("indodax", first.executedQtyEth);
-  if (!(filledIndodaxQty > 0)) {
-    const detail = `Indodax fill ${first.executedQtyEth} ETH is below lot size`;
-    haltUnpairedFill(wallet, first, "binance", binanceSide, detail);
-    throw new OrderError("indodax", detail);
+  const filledFirstQty = quantityForExchange(first, firstFill.executedQtyEth);
+  if (!(filledFirstQty > 0)) {
+    const detail = `${first} fill ${firstFill.executedQtyEth} ETH is below lot size`;
+    haltUnpairedFill(wallet, firstFill, second, secondSide, detail);
+    throw new OrderError(first, detail);
   }
 
-  const secondQty = quantityForExchange("binance", filledIndodaxQty);
+  const secondQty = quantityForExchange(second, filledFirstQty);
   if (!(secondQty > 0)) {
-    const detail = `Indodax fill ${first.executedQtyEth} ETH is below Binance lot size`;
-    haltUnpairedFill(wallet, first, "binance", binanceSide, detail);
-    throw new OrderError("binance", detail);
+    const detail = `${first} fill ${firstFill.executedQtyEth} ETH is below ${second} lot size`;
+    haltUnpairedFill(wallet, firstFill, second, secondSide, detail);
+    throw new OrderError(second, detail);
   }
 
-  await ensureBinanceFilters();
   const hedgePrice =
-    binanceSide === "SELL" ? opportunity.sellBidPrice : opportunity.buyAskPrice;
+    secondSide === "SELL" ? opportunity.sellBidPrice : opportunity.buyAskPrice;
   const hedgeNotional = secondQty * hedgePrice;
-  if (!binanceNotionalMeetsMinimum(secondQty, hedgePrice)) {
-    const detail = `Binance ${binanceSide} notional $${hedgeNotional.toFixed(2)} < min $${getBinanceMinNotionalUsdt().toFixed(2)} (${secondQty} ETH @ ${hedgePrice})`;
-    haltUnpairedFill(wallet, first, "binance", binanceSide, detail);
-    throw new OrderError("binance", detail);
+
+  if (second === "binance") {
+    await ensureBinanceFilters();
+    if (!binanceNotionalMeetsMinimum(secondQty, hedgePrice)) {
+      const detail = `Binance ${secondSide} notional $${hedgeNotional.toFixed(2)} < min $${getBinanceMinNotionalUsdt().toFixed(2)} (${secondQty} ETH @ ${hedgePrice})`;
+      haltUnpairedFill(wallet, firstFill, second, secondSide, detail);
+      throw new OrderError("binance", detail);
+    }
+  }
+  if (second === "hyperliquid") {
+    if (
+      !hyperliquidNotionalMeetsMinimum(secondQty, hedgePrice) ||
+      hedgeNotional < TRADE_LIMIT_USD
+    ) {
+      const detail = `Hyperliquid ${secondSide} notional $${hedgeNotional.toFixed(2)} < min $${getHyperliquidMinNotionalUsdc().toFixed(2)} (${secondQty} ETH @ ${hedgePrice})`;
+      haltUnpairedFill(wallet, firstFill, second, secondSide, detail);
+      throw new OrderError("hyperliquid", detail);
+    }
+    await assertFirstRowStillCovers(second, secondSide, secondQty, hedgePrice);
   }
 
-  if (binanceSide === "BUY" && secondQty > opportunity.buyAskQty) {
+  if (secondSide === "BUY" && secondQty > opportunity.buyAskQty) {
     const detail = `buy qty ${secondQty} ETH exceeds best-ask size ${opportunity.buyAskQty}`;
-    haltUnpairedFill(wallet, first, "binance", binanceSide, detail);
-    throw new OrderError("binance", detail);
+    haltUnpairedFill(wallet, firstFill, second, secondSide, detail);
+    throw new OrderError(second, detail);
   }
-  if (binanceSide === "SELL" && secondQty > opportunity.sellBidQty) {
+  if (secondSide === "SELL" && secondQty > opportunity.sellBidQty) {
     const detail = `sell qty ${secondQty} ETH exceeds best-bid size ${opportunity.sellBidQty}`;
-    haltUnpairedFill(wallet, first, "binance", binanceSide, detail);
-    throw new OrderError("binance", detail);
+    haltUnpairedFill(wallet, firstFill, second, secondSide, detail);
+    throw new OrderError(second, detail);
   }
 
   console.log(
-    `[Trade] Leg 2/2: binance ${binanceSide} ${secondQty.toFixed(8)} ETH`,
+    `[Trade] Leg 2/2: ${second} ${secondSide} ${secondQty.toFixed(8)} ETH`,
   );
 
   try {
-    const second = await placeMarketOrder(
-      "binance",
-      binanceSide,
+    const secondFill = await placeMarketOrder(
+      second,
+      secondSide,
       secondQty,
       undefined,
-      binanceClientId,
+      secondClientId,
+      second === "hyperliquid" || second === "indodax" ? hedgePrice : undefined,
+      second === "indodax"
+        ? secondSide === "BUY"
+          ? opportunity.buyAskPriceText
+          : opportunity.sellBidPriceText
+        : undefined,
     );
     console.log(
-      `[Trade] Leg 2 filled: ${second.exchange} order ${second.orderId} qty ${second.executedQtyEth.toFixed(8)} ETH`,
+      `[Trade] Leg 2 filled: ${secondFill.exchange} order ${secondFill.orderId} qty ${secondFill.executedQtyEth.toFixed(8)} ETH`,
     );
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    haltUnpairedFill(wallet, first, "binance", binanceSide, message);
+    haltUnpairedFill(wallet, firstFill, second, secondSide, message);
     throw error;
   }
 }
@@ -318,11 +441,21 @@ async function executeArbitrageAttempt(
     return { trade: null, attemptedLive: false };
   }
 
+  const { buyVenue, sellVenue } = parseDirection(opportunity.direction);
+  const bothListedLive = isExchangeLive(buyVenue) && isExchangeLive(sellVenue);
+  const needsHyperliquidKey =
+    buyVenue === "hyperliquid" || sellVenue === "hyperliquid";
+  const livePair =
+    bothListedLive &&
+    isLiveTradablePair(buyVenue, sellVenue) &&
+    !isPaperSimVenue(buyVenue) &&
+    !isPaperSimVenue(sellVenue) &&
+    (!needsHyperliquidKey || hasHyperliquidCredentials());
   console.log(
-    `[Trade] Executing ${DIRECTION_LABELS[opportunity.direction]} | $${opportunity.tradeNotionalUsd.toFixed(2)} (${opportunity.tradeSizeEth.toFixed(8)} ETH) | est. profit ${(opportunity.profitPerEth * opportunity.tradeSizeEth).toFixed(4)} USDT (${opportunity.profitPct.toFixed(4)}%)`,
+    `[Trade] Executing ${directionLabel(opportunity.direction)} | $${opportunity.tradeNotionalUsd.toFixed(2)} (${opportunity.tradeSizeEth.toFixed(8)} ETH) | est. profit ${(opportunity.profitPerEth * opportunity.tradeSizeEth).toFixed(4)} USDT (${opportunity.profitPct.toFixed(4)}%)`,
   );
 
-  if (LIVE_TRADING) {
+  if (LIVE_TRADING && livePair) {
     try {
       await executeLivePair(opportunity, wallet);
     } catch (error) {
@@ -330,8 +463,16 @@ async function executeArbitrageAttempt(
       console.error(`[Trade] Pair aborted: ${message}`);
       return { trade: null, attemptedLive: true };
     }
-  } else {
+  } else if (livePair) {
     console.log("[Trade] Simulation only (LIVE_TRADING is off)");
+  } else if (needsHyperliquidKey && bothListedLive && !hasHyperliquidCredentials()) {
+    console.log(
+      `[Trade] Simulation only (${directionLabel(opportunity.direction)} — set HYPERLIQUID_PRIVATE_KEY for live Hyperliquid orders)`,
+    );
+  } else {
+    console.log(
+      `[Trade] Simulation only (${directionLabel(opportunity.direction)} — venue is in SIMULATION_EXCHANGES)`,
+    );
   }
 
   const trade = createExecutedTrade(
@@ -345,7 +486,7 @@ async function executeArbitrageAttempt(
   wallet.applyTrade(settlement);
   console.log(`[Wallet] ${wallet.formatBalances()}`);
 
-  return { trade, attemptedLive: LIVE_TRADING };
+  return { trade, attemptedLive: LIVE_TRADING && livePair };
 }
 
 export async function tryExecuteOpportunities(
@@ -368,7 +509,7 @@ export async function tryExecuteOpportunities(
 
       if (isMarketOrderInFlight()) {
         console.log(
-          `[Trade] Skipping ${DIRECTION_LABELS[opportunity.direction]}: waiting for an in-flight market order response`,
+          `[Trade] Skipping ${directionLabel(opportunity.direction)}: waiting for an in-flight market order response`,
         );
         break;
       }
@@ -380,10 +521,10 @@ export async function tryExecuteOpportunities(
 
       if (trade) {
         progress.record(trade);
-        executedLabels.push(DIRECTION_LABELS[opportunity.direction]);
+        executedLabels.push(directionLabel(opportunity.direction));
       }
 
-      if (attemptedLive) {
+      if (trade || attemptedLive) {
         break;
       }
     }

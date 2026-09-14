@@ -1,8 +1,7 @@
 import { TRADE_LIMIT_USD } from "../config/trading";
+import type { ArbitrageDirection } from "./venues";
 
-export type ArbitrageDirection =
-  | "buy-binance-sell-indodax"
-  | "buy-indodax-sell-binance";
+export type { ArbitrageDirection };
 
 export interface ExecutedTrade {
   direction: ArbitrageDirection;
@@ -24,6 +23,13 @@ export class TradeProgressTracker {
     return this.trades.length;
   }
 
+  getLastTradeAt(): Date | null {
+    if (this.trades.length === 0) {
+      return null;
+    }
+    return this.trades[this.trades.length - 1].timestamp;
+  }
+
   getSummary(): string {
     if (this.trades.length === 0) {
       return "Progress: 0 trades";
@@ -37,7 +43,7 @@ export class TradeProgressTracker {
     const totalPctLabel = `${totalPct >= 0 ? "+" : ""}${totalPct.toFixed(4)}%`;
     const avgPctLabel = `${avgPct >= 0 ? "+" : ""}${avgPct.toFixed(4)}%`;
 
-    return `Progress: ${this.trades.length} trades ($${TRADE_LIMIT_USD} each), ${usdtLabel}, total ${totalPctLabel}, avg ${avgPctLabel}`;
+    return `${this.trades.length} trades @$${TRADE_LIMIT_USD}, ${usdtLabel}, total ${totalPctLabel} avg ${avgPctLabel}`;
   }
 }
 

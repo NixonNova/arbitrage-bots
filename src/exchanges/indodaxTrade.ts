@@ -85,7 +85,7 @@ async function syncIndodaxTime(): Promise<void> {
   console.log(`[Indodax] Time offset ${timeOffsetMs}ms`);
 }
 
-async function ensureIndodaxTimeSynced(force = false): Promise<void> {
+export async function ensureIndodaxTimeSynced(force = false): Promise<void> {
   if (!force && lastSyncedAt > 0 && Date.now() - lastSyncedAt < TIME_SYNC_INTERVAL_MS) {
     return;
   }
@@ -103,8 +103,16 @@ async function ensureIndodaxTimeSynced(force = false): Promise<void> {
   await syncInFlight;
 }
 
-function indodaxTimestamp(): string {
+export function indodaxTimestamp(): string {
   return Math.floor(Date.now() + timeOffsetMs).toString();
+}
+
+export function signIndodaxBody(body: string, secret: string): string {
+  return signSha256(body, secret);
+}
+
+export function getIndodaxCredentials(): { apiKey: string; apiSecret: string } {
+  return getCredentials();
 }
 
 function sleep(ms: number): Promise<void> {
